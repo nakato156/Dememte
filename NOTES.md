@@ -428,3 +428,23 @@ Hacer una cuarta corrida combinando lo mejor de E3 y E4:
 - evaluar con el nuevo campo `strict_acceptance_success`.
 
 Hipotesis: esta combinacion deberia mantener el buen orden y robustez de E4 tau 1.50, pero con `gate_raw` no saturado como E3.
+
+
+## Cambio posterior al analisis del 2026-05-11
+
+Despues de revisar la tercera ejecucion se actualizo el notebook para preparar la cuarta corrida:
+
+- Se agrego `e5_combined_dropout_ood_tau_150` a `experiment_names`.
+- Esta variante combina lo mejor de E3 y E4:
+  - `ood_tau = 1.5`
+  - `ood_beta = 8.0`
+  - `familiarity_width = 0.5`
+  - `phase3_lock_familiarity = True`
+  - `gate_dropout = 0.1`
+  - `lr_gate = 1e-4`
+  - `gate_raw_entropy_reg = 0.01`
+- Se parametrizaron los umbrales de aceptacion completa en `Config`:
+  - `acceptance_harmful_max = 0.006099`
+  - `acceptance_pareidolia_max = 0.005922`
+  - `acceptance_gate_raw_max = 0.95`
+- `strict_acceptance_success` ahora usa esos umbrales configurables en futuras corridas.
