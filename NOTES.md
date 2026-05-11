@@ -209,3 +209,55 @@ Estado de la conclusion:
 - La regularizacion nueva redujo el colapso exacto.
 - El comportamiento neuro-inspirado aun no esta logrado.
 - La senal OOD/familiaridad necesita calibracion adicional antes de considerar el issue resuelto.
+
+## Verificacion posterior del notebook
+
+Fecha de verificacion: 2026-05-08
+
+Se reviso si `experiments/VQ/attractor_memory.ipynb` habia sido ejecutado despues de implementar el plan de diagnostico y nuevos experimentos E0-E5.
+
+Resultado:
+
+- No hay evidencia de una tercera corrida completa.
+- El notebook fue modificado el 2026-05-08, pero los artefactos disponibles siguen siendo solo:
+  - `experiments/VQ/out/artifacts/dememte_attractor_memory_20260506_111651/`
+  - `experiments/VQ/out/artifacts/dememte_attractor_memory_20260507_104816/`
+- El ultimo `attractor_memory_results.csv` sigue fechado el 2026-05-07 11:54:28.
+- No existen artefactos nuevos esperados por el plan implementado:
+  - `attractor_signal_curves.csv`
+  - `e0_attractor_metrics.json`
+  - `e0_attractor_signal_curves.csv`
+- La celda E0 nueva del notebook aparece sin ejecucion ni outputs.
+- El output viejo de configuracion no contiene los campos nuevos agregados, como `gate_raw_entropy_reg`, `gate_dropout`, `phase3_memory_grad_mode`, `run_e0_latest_checkpoint_diagnostic` o `experiment_names`.
+
+Validacion del codigo:
+
+- El notebook sigue siendo JSON valido.
+- Todas las celdas de codigo parsean correctamente con `ast`.
+- `git diff --check` no reporta problemas de whitespace.
+
+Conclusion:
+
+- La implementacion del plan quedo en el notebook, pero todavia no fue ejecutada.
+- Las metricas que siguen siendo validas son las de la segunda corrida del 2026-05-07.
+- No se debe interpretar ningun output visible del notebook como resultado de E0-E5, porque son outputs heredados de la corrida anterior.
+
+Proximo paso recomendado:
+
+- Ejecutar el notebook desde cero en el entorno Jupyter/CUDA.
+- Primero revisar E0:
+  - confirmar si Gaussian heavy tiene `dq_norm` bajo o `familiarity` alta;
+  - confirmar si `ood_risk` no sube lo suficiente;
+  - confirmar si `gate_raw` sigue saturando cerca de `1.0`.
+- Luego correr el screening por defecto de `experiment_names`:
+  - `attractor_full`
+  - `e1_freeze_vq_phase3`
+  - `e2_vq_clean_only_phase3`
+  - `e3_gate_dropout_lr`
+  - `e4_ood_tau_075`
+  - `e4_ood_tau_100`
+  - `e4_ood_tau_150`
+- Comparar con Pareto estricto usando:
+  - `clean_acc >= 0.748252`
+  - `corrupt_acc_avg >= 0.399889`
+  - `gate_order_margin >= 0.03`
