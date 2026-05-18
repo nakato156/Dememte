@@ -56,13 +56,16 @@ The gate routes toward reconstructed features when quantization error is high (u
 
 | File | Purpose |
 |------|---------|
-| `experiments/VQ/dememte_variants.ipynb` | Main implementation with full AttentionSpatialVQVAE architecture |
-| `experiments/baseline.ipynb` | ResNet18 baseline (fair comparison reference) |
-| `experiments/hyperparameter_search.ipynb` | Hyperparameter tuning runs |
-| `experiments/generalization_analysis.ipynb` | Cross-dataset evaluation |
-| `experiments/xai_dememte_analysis.ipynb` | Explainability (attention maps, gate activations) |
+| `experiments/NOTEBOOKS.md` | Active notebook lineage toward the final E5 model |
+| `experiments/VQ/baseline.ipynb` | Fair ResNet18 vs DeMemte + VQ-VAE baseline reference |
+| `experiments/VQ/dememte_variants.ipynb` | Reduced `dememte_transformer` implementation, the VQ starting point |
+| `experiments/atracctor/attractor_memory.ipynb` | Main DeMemteAttractor experiment with E0-E5 screening |
+| `experiments/atracctor/no_ood_debug.ipynb` | Isolated debug notebook for the no-OOD gate behavior |
+| `experiments/atracctor/e5_final_clean.ipynb` | Final clean E5 notebook for checkpoint loading, metrics, gate curves, optional eval/retraining |
 | `README.md` | Full methodology, results tables, and discussion (Spanish) |
 | `explain.md` | Component-by-component architecture walkthrough |
+
+Legacy, duplicate, or side-track notebooks live under `archive/notebooks/` and are not part of the active execution path.
 
 ## Running Code
 
