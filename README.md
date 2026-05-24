@@ -8,6 +8,34 @@ Este trabajo presenta **DeMemte** (Deep Memory Network), una arquitectura de red
 
 ---
 
+## Cómo navegar el código
+
+El proyecto está estructurado como un módulo Python compartido + 4 notebooks orquestadores. Los notebooks anteriores quedaron archivados.
+
+### Layout
+
+- `src/dememte/` — módulo único de verdad: modelos, training (fases 1/2/3), corruption suite, evaluación, I/O.
+- `notebooks/` — 4 notebooks, uno por experimento. Cada uno tiene su propia carpeta `out/` con checkpoints, métricas y plots.
+  - `01_baseline/baseline.ipynb` — ResNet18 frozen, misma metodología en fases que E5. Baseline _fair 1:1_.
+  - `02_e5_winner/e5_winner.ipynb` — DeMemte E5 (variante ganadora) reproducible end-to-end.
+  - `03_ablations/ablations.ipynb` — 8 variantes del set crítico (E5 + 7 ablaciones), evaluadas en clean y corrupt.
+  - `04_finetune_vs_frozen/finetune_vs_frozen.ipynb` — comparativo central: ResNet18 fine-tuneado con corrupciones agresivas vs DeMemte frozen. Demuestra que el gate rompe el trade-off clean↔corrupt.
+- `archive/notebooks/` — notebooks legacy (baseline, attractor_memory, Dememte_e5y, e5_final_clean, no_ood_debug) conservados como referencia histórica.
+- `experiments/data/flowers-102/` — dataset descargado.
+- `experiments/atracctor/out/artifacts/dememte_e5_critical/` — corridas pre-computadas del E5 (5 seeds × 8 variantes); los notebooks pueden cargar estos checkpoints sin reentrenar.
+
+### Ejecutar
+
+Cada notebook arranca con `RUN_TRAINING = False`. En ese modo carga checkpoints existentes (o los siembra desde `experiments/atracctor/out/artifacts/` si no existen aún). Cambia a `True` para entrenar desde cero (1 seed por notebook, GPU requerida).
+
+Los notebooks se generan a partir de `scripts/build_notebooks.py`; corre ese script si modificas la plantilla.
+
+### Paridad
+
+El checkpoint legacy `dememte_e5_critical/seed_42/e5_combined_dropout_ood_tau_150/*.pt` carga con `src.dememte.models.DeMemteAttractor` y reproduce `clean_acc=0.811839` (idéntico a `metrics.json` de la corrida original).
+
+---
+
 ## 1. Introducción
 
 ### 1.1 Motivación

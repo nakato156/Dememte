@@ -1,0 +1,10 @@
+numpy
+pandas
+torch
+torchvision
+scikit-learn
+matplotlib
+scipy
+jupyter
+nbformat
+tqdm

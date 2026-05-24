@@ -1,0 +1,6 @@
+# Optional. The scraper runs with the Python standard library.
+# Install system package `poppler-utils` for best PDF text extraction:
+#   sudo apt-get install poppler-utils
+#
+# Python-only alternatives can be added later if richer PDF-to-Markdown
+# conversion is needed.

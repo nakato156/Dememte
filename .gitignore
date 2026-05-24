@@ -3,6 +3,7 @@ env/
 data/
 out/
 *.pth
+*.pt
 *.log
 __pycache__/
 *.ipynb_checkpoints
