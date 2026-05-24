@@ -1,4 +1,5 @@
 env/
+.venv*/
 data/
 out/
 *.pth
@@ -25,3 +26,6 @@ build/
 *.bak
 *.tmp
 *.swp
+
+Dememte-critica.md
+VALIDATIONS.md
