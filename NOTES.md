@@ -448,3 +448,342 @@ Despues de revisar la tercera ejecucion se actualizo el notebook para preparar l
   - `acceptance_pareidolia_max = 0.005922`
   - `acceptance_gate_raw_max = 0.95`
 - `strict_acceptance_success` ahora usa esos umbrales configurables en futuras corridas.
+
+
+## Actualizacion historica: refactor reproducible y evaluacion critica
+
+Fecha de registro: 2026-05-25
+
+Commits cubiertos:
+
+- `687cc10` - `Enhance training configuration for DeMemte model phases and add legacy sanity checks`
+- `7195625` - `Refactor notebook 01 to define two baselines for ResNet18 and streamline training/evaluation process`
+
+Objetivo de esta actualizacion:
+
+- Registrar los cambios hechos despues del analisis de E5 y de la tercera corrida.
+- Dejar documentado como se reorganizo el flujo reproducible de notebooks.
+- Registrar las metricas actuales que cambian la lectura historica del proyecto: E5 es fuerte contra un backbone congelado, pero no domina a ResNet18 con fine-tuning completo.
+
+### Commit `687cc10`: entrenamiento critico y checks legacy
+
+Archivo modificado:
+
+- `src/dememte/training.py`
+
+Cambios principales:
+
+- `configure_phase1` y `configure_phase2` ahora fuerzan `model.backbone.eval()` ademas de congelar parametros. Esto evita que el backbone congelado quede en modo entrenamiento por efecto de `model.train(train)`.
+- `configure_phase3` ahora recibe `train_backbone: bool = False`.
+- En Phase 3, si `phase3_backbone_train_mode == "partial_unfreeze"`, solo `layer4` del backbone puede ponerse en modo train cuando corresponde a entrenamiento real.
+- `run_epoch_phase3` llama `configure_phase3(model, config, train_backbone=train)`.
+- `train_phase3` configura Phase 3 con `train_backbone=True` antes de construir el optimizador.
+- Se agrego `_legacy_sanity_forward`:
+  - toma un batch del train loader;
+  - ejecuta forward sin gradiente;
+  - valida shapes de logits, gate, prior y gate raw;
+  - verifica finitud de SigReg;
+  - imprime diagnostico de `denoise_loss`, `vq_loss` y `sigreg`.
+- Se agrego `_legacy_phase2_gate_sanity`:
+  - toma un batch corrupto;
+  - mide `gate_mean`, `gate_prior` y `gate_raw`;
+  - advierte si el gate cae fuera de `[0.1, 0.9]`.
+- Se agrego `train_dememte_critical`, que reproduce el orden historico usado por el checkpoint E5 critico:
+  1. Phase 1.
+  2. Reset de calibracion del gate desde config.
+  3. Forward sanity check legacy antes de Phase 2.
+  4. Phase 2.
+  5. Gate sanity check legacy despues de Phase 2.
+  6. Phase 3.
+
+Motivacion tecnica:
+
+- Los checks legacy no son solo cosmeticos: consumen batches del DataLoader y avanzan la secuencia RNG.
+- Para reproducir el camino historico de entrenamiento del checkpoint E5, esos forward checks deben permanecer dentro del driver de entrenamiento y no como celdas opcionales de notebook.
+- La configuracion explicita de `eval()` en fases congeladas reduce drift por capas con comportamiento dependiente del modo train/eval.
+
+Impacto esperado:
+
+- Mayor reproducibilidad del protocolo E5 critico.
+- Mejor separacion entre backbone congelado, partial unfreeze y entrenamiento completo.
+- Menos ambiguedad entre "parametros congelados" y "modulo en modo eval".
+
+### Commit `7195625`: refactor de notebooks y baseline fuerte
+
+Archivos modificados:
+
+- `notebooks/01_baseline/baseline.ipynb`
+- `notebooks/02_e5_winner/e5_winner.ipynb`
+- `notebooks/03_ablations/ablations.ipynb`
+- `notebooks/04_finetune_vs_frozen/finetune_vs_frozen.ipynb`
+- `scripts/build_notebooks.py`
+
+Cambio de escala:
+
+- El proyecto paso de un baseline unico congelado a una bateria de notebooks mas explicita:
+  - Notebook 01: dos baselines ResNet18.
+  - Notebook 02: carga/evaluacion de E5 critico.
+  - Notebook 03: ablaciones del set critico.
+  - Notebook 04: comparacion entre fine-tuning completo y E5 con backbone congelado.
+- `scripts/build_notebooks.py` quedo como generador central de esa estructura.
+
+### Notebook 01: dos baselines oficiales
+
+Antes:
+
+- Notebook 01 describia principalmente un `ResNet18` con backbone congelado como baseline 1:1.
+
+Despues:
+
+- Se definieron dos baselines oficiales:
+  - `resnet18_frozen_linear_probe`
+  - `resnet18_finetuned_aug`
+- Se agrego una lista `BASELINES` con:
+  - `id`
+  - `label`
+  - `freeze_backbone`
+  - `train_corrupt_prob`
+  - checkpoint legacy opcional.
+- El loop ahora entrena/carga/evalua multiples baselines.
+- Se agrego manejo de checkpoints por subdirectorio:
+  - `notebooks/01_baseline/out/resnet18_frozen_linear_probe/best.pt`
+  - `notebooks/01_baseline/out/resnet18_finetuned_aug/best.pt`
+- Si existe checkpoint legacy del frozen baseline, se puede sembrar el nuevo path.
+- Se consolidan outputs agregados:
+  - `baseline_summary.csv`
+  - `baseline_curves.csv`
+  - `baselines_metrics.json`
+- Se mantienen outputs historicos top-level para el frozen linear probe:
+  - `metrics.json`
+  - `predictions.csv`
+  - `corrupt_curves.csv`
+- Las curvas de robustez ahora comparan modelos por corrupcion en una grilla 2x2.
+
+Metricas actuales del notebook 01:
+
+| Modelo | clean_acc | corrupt_acc_avg | gaussian_noise | pixel_mask | cutout | blur | ECE clean | ECE corrupt |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| ResNet18 frozen linear-probe | 0.562043 | 0.291904 | 0.144034 | 0.112593 | 0.463978 | 0.447010 | 0.465952 | 0.225121 |
+| ResNet18 fine-tuned + data augmentation | 0.879167 | 0.578089 | 0.396162 | 0.306012 | 0.795360 | 0.814821 | 0.172045 | 0.167071 |
+
+Interpretacion:
+
+- El baseline fine-tuned completo es mucho mas fuerte que el baseline congelado.
+- Esto cambia el marco de comparacion de E5: ya no basta con superar al frozen linear probe para afirmar robustez competitiva.
+
+### Notebook 02: E5 critico reproducible
+
+Cambios principales:
+
+- El notebook 02 quedo centrado en `e5_combined_dropout_ood_tau_150`.
+- Usa `train_dememte_critical` cuando `RUN_TRAINING=True`, preservando los sanity checks legacy del commit `687cc10`.
+- Con `RUN_TRAINING=False`, carga el checkpoint legacy ganador tau 1.50 y lo copia a:
+  - `notebooks/02_e5_winner/out/e5_best.pt`
+- La evaluacion escribe:
+  - `metrics.json`
+  - `predictions.csv`
+  - `signal_curves.csv`
+  - `gate_plots/gate_and_robustness.png`
+
+Metricas actuales del notebook 02:
+
+| Metrica | Valor |
+|---|---:|
+| clean_acc | 0.811839 |
+| corrupt_acc_avg | 0.521264 |
+| gaussian_noise | 0.339567 |
+| pixel_mask | 0.315715 |
+| cutout | 0.704396 |
+| blur | 0.725375 |
+| gate_mean_clean | 0.234758 |
+| pred_change_rate | 0.993508 |
+| beneficial_changes | 0.517211 |
+| harmful_changes | 0.004608 |
+| pareidolia_rate | 0.000312 |
+| ECE clean | 0.359240 |
+| ECE corrupt avg | 0.261126 |
+
+Curvas relevantes de E5:
+
+| Condicion | Severidad | acc | gate | familiarity | ood_risk |
+|---|---:|---:|---:|---:|---:|
+| clean | 0.00 | 0.8118 | 0.2348 | 0.4399 | 0.0721 |
+| gaussian_noise | 0.50 | 0.5531 | 0.2270 | 0.4254 | 0.0482 |
+| gaussian_noise | 1.00 | 0.3381 | 0.1674 | 0.3054 | 0.0122 |
+| gaussian_noise | 1.50 | 0.1275 | 0.1002 | 0.1686 | 0.0016 |
+| blur | 0.35 | 0.7944 | 0.2297 | 0.4303 | 0.0907 |
+| blur | 0.60 | 0.7440 | 0.2257 | 0.4219 | 0.0854 |
+| blur | 0.85 | 0.6377 | 0.2193 | 0.4080 | 0.0548 |
+
+Interpretacion:
+
+- E5 mejora mucho sobre `ResNet18 frozen linear-probe`.
+- E5 queda por debajo de `ResNet18 fine-tuned + data augmentation` en clean y corrupt promedio.
+- El gate baja con ruido gaussiano severo y se mantiene mas abierto en blur, lo cual es compatible con la idea de intervencion selectiva.
+- La senal `ood_risk` no sube con severidad gaussiana; en estos artefactos baja. Por tanto, el cierre observable del gate no debe atribuirse solo a OOD, sino tambien a familiaridad/prior.
+- La tasa de pareidolia queda muy baja bajo la definicion operacional actual.
+
+### Notebook 03: ablaciones del set critico
+
+Cambios principales:
+
+- Se organiza la evaluacion de 8 variantes:
+  - `e5_combined_dropout_ood_tau_150`
+  - `no_ood`
+  - `no_familiarity`
+  - `no_antipareidolia`
+  - `freeze_vq_phase3`
+  - `partial_unfreeze_backbone`
+  - `attractor_disabled`
+  - `resnet18_transfer_baseline`
+- La variante E5 carga siempre:
+  - `notebooks/02_e5_winner/out/e5_best.pt`
+- Las demas variantes buscan primero checkpoint local y luego checkpoint legacy en:
+  - `experiments/atracctor/out/artifacts/dememte_e5_critical/seed_42/`
+- Se escriben:
+  - `ablation_summary.csv`
+  - `ablation_summary.md`
+  - `ablation_curves.csv`
+  - `plots/ablations_clean_vs_corrupt.png`
+
+Resultados actuales de ablacion:
+
+| Variante | clean_acc | corrupt_acc_avg | gaussian_noise | pixel_mask | cutout | blur |
+|---|---:|---:|---:|---:|---:|---:|
+| resnet18_transfer_baseline | 0.814441 | 0.548802 | 0.386730 | 0.313438 | 0.747059 | 0.747981 |
+| no_antipareidolia | 0.821597 | 0.531943 | 0.353228 | 0.336369 | 0.711064 | 0.727110 |
+| no_ood | 0.815742 | 0.530981 | 0.362173 | 0.330081 | 0.701957 | 0.729712 |
+| e5_combined_dropout_ood_tau_150 | 0.811839 | 0.521264 | 0.339567 | 0.315715 | 0.704396 | 0.725375 |
+| partial_unfreeze_backbone | 0.860790 | 0.518011 | 0.276956 | 0.220361 | 0.764298 | 0.810430 |
+| no_familiarity | 0.797691 | 0.514094 | 0.335447 | 0.303247 | 0.704722 | 0.712961 |
+| attractor_disabled | 0.802570 | 0.513403 | 0.330894 | 0.306391 | 0.698433 | 0.717895 |
+| freeze_vq_phase3 | 0.488209 | 0.240961 | 0.126579 | 0.116821 | 0.328834 | 0.391608 |
+
+Insights:
+
+- `freeze_vq_phase3` confirma que la ruta VQ/proyector/desproyector necesita ajuste en Phase 3; congelarla destruye performance.
+- `no_antipareidolia` y `no_ood` superan a E5 en corrupt promedio. Esto indica que OOD y anti-pareidolia se comportan como restricciones de seguridad/conservadurismo, no como maximizadores directos de accuracy.
+- `attractor_disabled` queda cerca de E5 en corrupt promedio (`0.5134` vs `0.5213`), por lo que el atractor aporta pero no explica por si solo la robustez.
+- `resnet18_transfer_baseline` queda como variante mas fuerte en corrupt promedio dentro del set de ablaciones.
+- `partial_unfreeze_backbone` mejora clean y corrupciones recuperables como cutout/blur, pero empeora Gaussian y pixel mask.
+
+Conclusion de ablaciones:
+
+- El framework Dememte aporta mecanismos auditables, pero la evidencia no sostiene que todos sus componentes mejoren accuracy.
+- La lectura correcta es trade-off: seguridad/interpretabilidad de intervencion versus rendimiento bruto.
+
+### Notebook 04: fine-tuning completo vs E5 congelado
+
+Cambios principales:
+
+- Se define la condicion A:
+  - `A_resnet_ft_corrupt`
+  - ResNet18 con backbone completo entrenable.
+  - `train_corrupt_prob = 0.85`.
+  - Agenda mas agresiva: warmup 2, corrupt 8, joint 12.
+- Se define la condicion B:
+  - `B_dememte_e5_frozen`
+  - carga E5 desde `notebooks/02_e5_winner/out/e5_best.pt` o checkpoint legacy.
+  - no reentrena E5.
+- Se escriben:
+  - `comparison_table.csv`
+  - `comparison_curves.csv`
+  - `plots/robustness_curves.png`
+  - `plots/scatter_tradeoff.png`
+
+Resultados actuales del notebook 04:
+
+| Condicion | clean_acc | corrupt_acc_avg | gaussian_noise | pixel_mask | cutout | blur | ECE clean | gap clean-corrupt |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| A_resnet_ft_corrupt | 0.895593 | 0.683539 | 0.566542 | 0.484577 | 0.837155 | 0.845883 | 0.070239 | 0.212053 |
+| B_dememte_e5_frozen | 0.765653 | 0.426018 | 0.217163 | 0.143817 | 0.667588 | 0.675503 | 0.392510 | 0.339635 |
+
+Interpretacion:
+
+- En esta comparacion, el fine-tuning completo con corrupciones agresivas domina claramente a E5.
+- La tesis fuerte de que E5 rompe el trade-off clean/corrupt no queda respaldada por estos artefactos.
+- E5 tiene un gap clean-corrupt mayor y peor calibracion que la ResNet18 fine-tuned corruptiva.
+- El resultado obliga a presentar Dememte como framework auditable de memoria selectiva, no como baseline dominante de accuracy.
+
+### Inconsistencia detectada entre notebooks 02 y 04
+
+Se detecto una diferencia importante:
+
+- Notebook 02 reporta E5:
+  - `clean_acc = 0.811839`
+  - `corrupt_acc_avg = 0.521264`
+- Notebook 04 reporta `B_dememte_e5_frozen`:
+  - `clean_acc = 0.765653`
+  - `corrupt_acc_avg = 0.426018`
+
+Posibles causas:
+
+- Checkpoints no sincronizados entre notebook 02 y notebook 04.
+- Ejecuciones en momentos distintos con artefactos heredados.
+- Diferencias de carga entre `E5_CKPT` y `LEGACY_E5`.
+- Estado de notebooks con outputs no regenerados en orden lineal.
+
+Recomendacion:
+
+- Reejecutar en orden:
+  1. `notebooks/01_baseline/baseline.ipynb`
+  2. `notebooks/02_e5_winner/e5_winner.ipynb`
+  3. `notebooks/03_ablations/ablations.ipynb`
+  4. `notebooks/04_finetune_vs_frozen/finetune_vs_frozen.ipynb`
+- Registrar hashes de checkpoints usados por cada notebook.
+- Confirmar si `notebooks/04_finetune_vs_frozen/out/comparison_table.csv` se genero despues de copiar/cargar exactamente el mismo `e5_best.pt` del notebook 02.
+
+### Cambio de conclusion historica
+
+Antes de estos commits, la narrativa principal era:
+
+- E5 como variante ganadora del set critico.
+- Exito definido por balance entre clean, corrupt, gate order, harmful changes, pareidolia y gate raw.
+
+Despues de estos commits, la narrativa queda mas matizada:
+
+- E5 sigue siendo fuerte frente a una ResNet18 congelada.
+- E5 no supera a ResNet18 con fine-tuning completo y augmentacion.
+- En ablaciones, quitar OOD o anti-pareidolia mejora accuracy bruta.
+- El valor diferencial de Dememte queda en:
+  - memoria latente explicita;
+  - gate auditable;
+  - medicion de intervencion;
+  - metricas de cambios beneficiosos/daninos;
+  - baja pareidolia bajo la definicion operacional actual.
+- No queda demostrado que Dememte sea superior como metodo puro de accuracy robusta.
+
+### Estado actual despues de los dos commits
+
+Archivos relevantes:
+
+- Entrenamiento critico:
+  - `src/dememte/training.py`
+- Generador de notebooks:
+  - `scripts/build_notebooks.py`
+- Notebooks activos:
+  - `notebooks/01_baseline/baseline.ipynb`
+  - `notebooks/02_e5_winner/e5_winner.ipynb`
+  - `notebooks/03_ablations/ablations.ipynb`
+  - `notebooks/04_finetune_vs_frozen/finetune_vs_frozen.ipynb`
+
+Outputs relevantes:
+
+- `notebooks/01_baseline/out/baseline_summary.csv`
+- `notebooks/01_baseline/out/baseline_curves.csv`
+- `notebooks/02_e5_winner/out/metrics.json`
+- `notebooks/02_e5_winner/out/signal_curves.csv`
+- `notebooks/03_ablations/out/ablation_summary.csv`
+- `notebooks/03_ablations/out/ablation_curves.csv`
+- `notebooks/04_finetune_vs_frozen/out/comparison_table.csv`
+- `notebooks/04_finetune_vs_frozen/out/comparison_curves.csv`
+
+Proximos pasos recomendados:
+
+- Resolver la inconsistencia E5 notebook 02 vs notebook 04.
+- Ejecutar multiples semillas para estimar varianza.
+- Agregar hashes de checkpoints a las tablas de resultados.
+- Separar explicitamente dos objetivos en futuros papers/reportes:
+  - robustez predictiva pura;
+  - seguridad/auditabilidad de intervencion memoristica.
+- Si se quiere competir en accuracy, comparar contra fine-tuning completo como baseline principal, no solo contra frozen linear probe.

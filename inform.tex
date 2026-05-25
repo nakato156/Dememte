@@ -8,6 +8,8 @@
 \usepackage{longtable}
 \usepackage{amsmath}
 \usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{placeins}
 \usepackage{hyperref}
 \usepackage{xcolor}
 \usepackage{url}
@@ -16,8 +18,7 @@
 \hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
 \renewcommand{\arraystretch}{1.12}
 
-\title{\textbf{DeMemteAttractor E5: memoria atractora con compuerta anti-pareidolia para clasificación robusta}\\
-\large Recapitulación metodológica de \texttt{e5\_final\_clean.ipynb}}
+\title{\textbf{Dememte: un framework de memoria latente selectiva para clasificación robusta bajo corrupciones}}
 \author{Christian Borasino}
 \date{}
 
@@ -25,261 +26,132 @@
 \maketitle
 
 \begin{abstract}
-Este informe recapitula, en formato de artículo técnico, el contenido del
-notebook \texttt{experiments/atracctor/e5\_final\_clean.ipynb}. La libreta
-consolida la variante final \textit{E5 combined dropout + OOD tau 1.50} de
-DeMemteAttractor, un modelo que combina una ResNet18 congelada, una memoria
-latente vector-cuantizada, un módulo atractor residual y una compuerta de
-ambigüedad guiada por incertidumbre, familiaridad, conflicto y riesgo de fuera
-de distribución. La contribución práctica de E5 no consiste en maximizar una
-sola métrica, sino en satisfacer simultáneamente precisión limpia, robustez ante
-corrupciones, ordenamiento funcional de la compuerta y control de intervenciones
-dañinas. En los artefactos cargados por el notebook, E5 obtiene 0.7653 de
-precisión limpia, la mejor precisión corrupta promedio reportada, 0.4313, y es
-la única variante con \texttt{strict\_acceptance\_success=True}. Este resultado
-se logra al evitar la saturación del gate crudo, cerrar la memoria ante ruido
-gaussiano severo y mantener intervención moderada frente a corrupciones más
-recuperables como blur y cutout.
+Dememte es un framework de clasificación robusta basado en memoria latente,
+atractores residuales y compuertas adaptativas. Su hipótesis central es que una
+representación dañada por una corrupción puede beneficiarse de una memoria de
+patrones, pero que dicha memoria debe intervenir de forma condicionada para no
+inducir errores espurios. Este trabajo presenta la arquitectura
+DeMemteAttractor E5, su protocolo experimental en Flowers102, las métricas de
+robustez y seguridad usadas para evaluarla, y un análisis de ablaciones frente a
+baselines ResNet18. Los resultados muestran un cuadro mixto. E5 mejora
+fuertemente a una ResNet18 congelada con linear probe, pasando de 0.5620 a
+0.8118 en accuracy limpia y de 0.2919 a 0.5213 en accuracy corrupta promedio.
+Sin embargo, no supera a baselines con fine-tuning completo: una ResNet18
+fine-tuned con augmentación alcanza 0.8792/0.5781, y una variante con
+corrupciones agresivas alcanza 0.8956/0.6835. Las ablaciones muestran además que
+componentes diseñados para seguridad, como OOD y anti-pareidolia, no maximizan
+la accuracy bruta. El valor principal de Dememte no queda establecido como
+superioridad predictiva absoluta, sino como una formulación auditable de
+intervención memorística selectiva.
 \end{abstract}
 
 \section{Introducción}
 
-\texttt{e5\_final\_clean.ipynb} es una versión depurada para preservar y explicar
-la variante final ganadora del proyecto DeMemteAttractor. Su propósito declarado
-es conservar la variante \texttt{E5 combined dropout + OOD tau 1.50} y reunir lo
-necesario para cargar el checkpoint final, revisar métricas guardadas, graficar
-el comportamiento de la compuerta, recomputar la evaluación completa si se
-requiere y reentrenar E5 de forma opcional.
+Los modelos de visión entrenados con augmentación suelen mejorar su desempeño
+bajo corrupciones, especialmente cuando se permite fine-tuning completo del
+backbone. Sin embargo, esa estrategia optimiza la robustez de manera implícita:
+no expone cuándo el modelo decide corregir una representación, qué evidencia usa
+para hacerlo, ni cuándo una corrección puede ser contraproducente. Dememte
+explora una alternativa: insertar una memoria latente explícita entre el
+backbone y el clasificador, y controlar su efecto mediante una compuerta
+adaptativa.
 
-El problema experimental es la clasificación de \texttt{Flowers102} bajo
-condiciones limpias y corruptas. La hipótesis operacional codificada en el
-notebook es que una memoria latente puede recuperar representaciones dañadas,
-pero que dicha memoria no debe intervenir indiscriminadamente. Si una
-perturbación es recuperable, la memoria puede actuar como mecanismo de
-completamiento; si la entrada se aleja del dominio familiar, una intervención
-fuerte puede producir pareidolia, es decir, una corrección que induce una clase
-errónea. Por ello, el éxito se define mediante una evaluación compuesta y no por
-precisión aislada.
+La motivación no es que toda entrada corrupta deba ser ``reparada''. Algunas
+corrupciones preservan estructura suficiente para que una memoria de patrones
+complete información faltante; otras alejan la muestra del dominio familiar y
+pueden inducir pareidolia, entendida aquí como una intervención de memoria que
+convierte una predicción base correcta en una predicción final errónea. Por ello,
+Dememte separa dos objetivos: mejorar robustez y medir el riesgo de intervención.
 
-La variante final se denomina internamente
-\texttt{e5\_combined\_dropout\_ood\_tau\_150} y se presenta en los artefactos
-como \textit{E5 combined dropout + OOD tau 1.50}. Esta recapitulación toma
-exclusivamente la arquitectura, la configuración y los artefactos que el propio
-notebook carga.
+Este paper introduce el framework Dememte a partir de su variante
+DeMemteAttractor E5. La evaluación es deliberadamente crítica. E5 se compara con
+baselines congelados, baselines fine-tuned y un conjunto de ablaciones que
+eliminan o modifican señales internas. La evidencia disponible no permite
+presentar E5 como un modelo dominante en accuracy. Sí permite analizar qué
+propiedades emergen cuando una memoria latente se vuelve explícita y
+monitorizable.
 
-\section{Método}
+\section{Framework Dememte}
 
-DeMemteAttractor parte de una ResNet18 preentrenada en ImageNet y truncada antes
-de sus capas finales. El backbone produce un mapa espacial de 512 canales que se
-mantiene congelado. Sobre esta representación se construye una ruta latente con
-tres elementos: un proyector $1\times1$ hacia 128 canales, un cuantizador
-vectorial 2D con 1024 embeddings y un desproyector $1\times1$ de vuelta a 512
-canales. En paralelo, un atractor residual aprende correcciones token a token en
-el espacio latente.
+Dememte define una familia de modelos con cuatro bloques:
+\begin{enumerate}
+    \item un encoder visual que produce features espaciales;
+    \item una memoria latente vector-cuantizada;
+    \item un atractor residual que propone una corrección;
+    \item una compuerta que regula cuánto de esa corrección entra al
+    clasificador final.
+\end{enumerate}
 
-La forma general del modelo puede resumirse como:
-\[
-x \xrightarrow{\text{ResNet18}} f
-\xrightarrow{\text{projector}} z
-\xrightarrow{\text{attractor}} z_{\text{completed}}.
-\]
-El atractor no reemplaza directamente a $z$; produce una corrección residual:
-\[
-\Delta = z_{\text{completed}} - \operatorname{stopgrad}(z).
-\]
-La representación final queda modulada por una compuerta escalar por muestra:
-\[
-z_{\text{final}} = z + g\Delta.
-\]
-Después, $z_{\text{final}}$ se desproyecta al espacio de 512 canales y se
-clasifica con una cabeza lineal. Una cabeza auxiliar clasifica las features
-originales del backbone y cumple dos funciones: proveer una referencia base y
-alimentar la señal de incertidumbre usada por el gate.
+En la instancia evaluada, el encoder es una ResNet18 preentrenada en ImageNet y
+congelada. El backbone produce un mapa espacial de 512 canales. Un proyector
+$1\times1$ reduce la representación a 128 canales, donde opera una memoria VQ
+con 1024 embeddings. Luego un desproyector $1\times1$ devuelve la representación
+al espacio de 512 canales antes de la clasificación.
 
-\subsection{Memoria vector-cuantizada}
+\subsection{Memoria latente}
 
-El módulo \texttt{VectorQuantizer2D} transforma el mapa latente en tokens
-espaciales y asigna cada token al embedding más cercano de un codebook de 1024
-vectores. La distancia usada es cuadrática:
+La memoria usa cuantización vectorial sobre tokens espaciales. Para cada token
+latente $z$, se selecciona el embedding más cercano del codebook usando distancia
+cuadrática:
 \[
 d(z,e)=\|z\|^2 - 2ze^\top + \|e\|^2.
 \]
-El módulo devuelve el cuantizado con estimador straight-through, una pérdida VQ
-y un mapa de discrepancia \texttt{dq\_map}. La pérdida VQ combina compromiso del
-encoder y actualización del codebook:
-\[
-\mathcal{L}_{vq}
-= c\,\operatorname{MSE}(z_e,\operatorname{stopgrad}(q))
-+ \operatorname{MSE}(q,\operatorname{stopgrad}(z_e)),
-\]
-con $c=0.25$. El \texttt{dq\_map} se vuelve una señal central para juzgar
-familiaridad: si la representación continua queda lejos del codebook, el modelo
-interpreta que la entrada puede ser menos confiable para intervención
-memorística.
+El cuantizador entrega una representación discreta con estimador
+straight-through, una pérdida VQ y un mapa de discrepancia $dq$. Esta
+discrepancia se reutiliza como señal de familiaridad: si la activación continua
+queda lejos del codebook, la memoria puede ser menos confiable.
 
 \subsection{Atractor residual}
 
-\texttt{AttractorMemory} es un MLP residual aplicado a cada token latente. Su
-arquitectura es $128 \rightarrow 512 \rightarrow 128$ con activación
-\texttt{GELU}. Al sumar la salida al token original, el atractor aprende
-correcciones y no una sustitución completa de la representación. Esta decisión
-es coherente con la función de E5: completar cuando conviene, pero conservar una
-ruta directa disponible.
+El atractor es un MLP residual aplicado token a token:
+\[
+128 \rightarrow 512 \rightarrow 128.
+\]
+La salida no reemplaza el latente original; define una propuesta de corrección:
+\[
+\Delta = z_{\text{completed}} - \operatorname{stopgrad}(z).
+\]
+La representación usada por el clasificador es:
+\[
+z_{\text{final}} = z + g\Delta,
+\]
+donde $g$ es la compuerta por muestra. Esta formulación permite que el modelo
+aprenda una ruta de memoria sin eliminar la ruta original.
 
-\subsection{Compuerta de ambigüedad}
+\subsection{Compuerta adaptativa}
 
-\texttt{AmbiguityGate} recibe cuatro señales por muestra:
-\[
-\text{uncertainty},\quad \text{familiarity},\quad \text{conflict},\quad
-1-\text{ood\_risk}.
-\]
-La incertidumbre es la entropía normalizada de los logits auxiliares. La
-familiaridad es una gaussiana sobre el error VQ normalizado por estadísticas EMA:
-\[
-dq_{\text{norm}}=\frac{dq_{\text{score}}-\mu_{EMA}}{\sigma_{EMA}+10^{-5}},
-\]
-\[
-\text{familiarity}
-=\exp\left(
--\frac{(dq_{\text{norm}}-\text{midpoint})^2}{2\,\text{width}^2}
-\right).
-\]
-El conflicto se obtiene como entropía normalizada de las asignaciones blandas del
-cuantizador. El riesgo OOD se calcula con una sigmoide:
-\[
-\text{ood\_risk}=\sigma\left(\beta(dq_{\text{norm}}-\tau)\right).
-\]
+La compuerta usa cuatro señales: incertidumbre del clasificador auxiliar,
+familiaridad VQ, conflicto de asignación del codebook y riesgo OOD. La
+familiaridad se deriva de una gaussiana sobre el error VQ normalizado por
+estadísticas EMA. El riesgo OOD se parametriza con una sigmoide sobre el mismo
+espacio normalizado.
 
-La compuerta final combina un prior interpretable con un MLP pequeño:
+La compuerta combina un prior interpretable con una salida aprendida:
 \[
 \text{gate\_prior}
-=\text{uncertainty}\cdot\text{familiarity}\cdot(1-\text{ood\_risk}),
+= \text{uncertainty}\cdot \text{familiarity}\cdot(1-\text{ood\_risk}),
 \]
 \[
 g = floor + (1-floor)\cdot \text{gate\_prior}\cdot \text{gate\_raw}.
 \]
-El piso se fija en 0.02. Este diseño impide que el modelo dependa solo de una
-red aprendida opaca: incluso si el MLP produce un \texttt{gate\_raw} alto, el
-prior puede cerrar la intervención cuando la familiaridad cae o el riesgo OOD
-sube.
+La configuración de E5 fija $floor=0.02$, $\tau_{\mathrm{OOD}}=1.5$,
+$\beta_{\mathrm{OOD}}=8.0$, ancho de familiaridad 0.5 y dropout del gate 0.1.
 
-\section{Entrenamiento}
+\section{Metodología experimental}
 
-El notebook conserva un entrenamiento en tres fases, aunque por defecto no lo
-ejecuta porque \texttt{RUN\_TRAINING=False}. La presencia de este bloque permite
-reproducir la construcción de E5 desde cero si se activa manualmente.
+\subsection{Dataset y partición}
 
-\subsection{Fase 1: estabilización de la memoria latente}
+La evaluación se realiza en Flowers102. El protocolo concatena los splits
+oficiales \texttt{train} y \texttt{val}, y luego genera una nueva división
+estratificada con \texttt{val\_ratio=0.2} y semilla 42. El split oficial
+\texttt{test} se reserva para evaluación. Las imágenes se redimensionan a
+$224\times224$ y se normalizan con medias y desviaciones ImageNet.
 
-La primera fase congela backbone, atractor, gate y clasificadores. Solo entrena
-proyector, cuantizador y desproyector. El objetivo es que la memoria latente
-aprenda a reconstruir las features del backbone antes de recibir presión de
-clasificación. Durante entrenamiento se enmascara una fracción de features con
-\texttt{masked\_feature\_ratio=0.35}. La pérdida de fase 1 es:
-\[
-\mathcal{L}_{P1}
-=0.5\mathcal{L}_{recon}
-+0.25\mathcal{L}_{vq}
-+\lambda_{sigreg}\mathcal{L}_{sigreg}.
-\]
-La regularización \texttt{SigReg} penaliza desviaciones de la covarianza latente
-respecto a la identidad, con sketch de dimensión 64.
+Durante entrenamiento se usa \texttt{RandomHorizontalFlip},
+\texttt{ColorJitter} y corrupciones aleatorias. Durante evaluación se usa una
+suite determinista de cuatro corrupciones y tres severidades cada una.
 
-\subsection{Fase 2: aprendizaje de atractor, gate y cabezas}
-
-La segunda fase congela la memoria latente ya inicializada y entrena el atractor,
-la compuerta y las dos cabezas de clasificación. Cada lote se evalúa en versión
-limpia y en versión corrupta. El objetivo latente limpio se calcula sin gradiente
-y se usa como referencia de denoising para la entrada corrupta. La pérdida
-incluye reconstrucción latente, clasificación limpia, entropía de gate y SigReg:
-\[
-\mathcal{L}_{P2}
-=\mathcal{L}_{mse,dirty}
-+0.3\mathcal{L}_{mse,clean}
-+\mathcal{L}_{CE,clean}
-+\lambda_H\mathcal{R}_{gate}
-+\lambda_{raw}\mathcal{R}_{gate\_raw}
-+\lambda_{sigreg}\mathcal{L}_{sigreg}.
-\]
-La función \texttt{phase2\_gate\_sanity} comprueba que el gate medio en un batch
-corrupto no colapse fuera de $[0.1,0.9]$.
-
-\subsection{Fase 3: ajuste conjunto y control anti-pareidolia}
-
-La tercera fase optimiza clasificación limpia y corrupta, denoising, VQ,
-regularización del gate, regularización latente y una pérdida anti-pareidolia.
-En la configuración final de E5, \texttt{phase3\_memory\_grad\_mode=full}, por
-lo que la memoria latente también puede ajustarse. La pérdida agregada es:
-\[
-\begin{aligned}
-\mathcal{L}_{P3}=&\ 0.5(\mathcal{L}_{CE,clean}+\mathcal{L}_{CE,dirty})\\
-&+0.5w_{denoise}(\mathcal{L}_{mse,clean}+\mathcal{L}_{mse,dirty})\\
-&+0.5w_{vq}(\mathcal{L}_{vq,clean}+\mathcal{L}_{vq,dirty})\\
-&+w_{anti}\mathcal{L}_{anti}
-+\lambda_H\mathcal{R}_{gate}
-+\lambda_{raw}\mathcal{R}_{gate\_raw}
-+\lambda_{sigreg}\mathcal{L}_{sigreg}.
-\end{aligned}
-\]
-La pérdida anti-pareidolia penaliza dos patrones: gate alto cuando la
-familiaridad es baja, y gate alto cuando el clasificador auxiliar acierta pero la
-salida final se equivoca. Este término alinea el entrenamiento con el criterio
-de seguridad: la memoria no debe inventar estructura donde la señal de
-familiaridad no la respalda.
-
-\section{Definición de la variante E5}
-
-El notebook define una única especificación final en \texttt{experiment\_specs}.
-Todas las señales del gate permanecen activas:
-\texttt{use\_uncertainty=True}, \texttt{use\_familiarity=True},
-\texttt{use\_conflict=True} y \texttt{use\_ood=True}. Sobre la configuración base
-se aplican los overrides de la Tabla~\ref{tab:e5_config}.
-
-\begin{table}[h]
-\centering
-\begin{tabular}{ll}
-\toprule
-Parámetro & Valor en E5 \\
-\midrule
-\texttt{ood\_tau} & 1.5 \\
-\texttt{ood\_beta} & 8.0 \\
-\texttt{familiarity\_width} & 0.5 \\
-\texttt{phase3\_lock\_familiarity} & \texttt{True} \\
-\texttt{gate\_dropout} & 0.1 \\
-\texttt{lr\_gate} & $1\cdot10^{-4}$ \\
-\texttt{gate\_raw\_entropy\_reg} & 0.01 \\
-\bottomrule
-\end{tabular}
-\caption{Modificaciones que definen la variante E5 respecto a la configuración base.}
-\label{tab:e5_config}
-\end{table}
-
-Estos cambios atacan directamente el fallo observado en variantes anteriores: la
-saturación del gate. Un \texttt{ood\_tau} de 1.5 con \texttt{ood\_beta=8.0}
-vuelve más decisivo el cierre de la compuerta cuando el error VQ normalizado
-supera el umbral. Un \texttt{familiarity\_width} de 0.5 estrecha la región
-considerada familiar. Al bloquear la familiaridad durante fase 3, el notebook
-evita que el entrenamiento posterior ensanche esa señal para permitir
-intervenciones excesivas. Finalmente, \texttt{gate\_dropout=0.1},
-\texttt{lr\_gate=1e-4} y la entropía sobre \texttt{gate\_raw} reducen la
-tendencia del MLP del gate a colapsar hacia uno.
-
-\section{Protocolo experimental}
-
-El dataset se construye con \texttt{torchvision.datasets.Flowers102}. Los splits
-\texttt{train} y \texttt{val} se concatenan y se vuelven a dividir con
-\texttt{StratifiedShuffleSplit}, usando \texttt{val\_ratio=0.2} y
-\texttt{split\_seed=42}. El split \texttt{test} oficial se conserva para la
-evaluación final. Las imágenes se redimensionan a $224\times224$ y se normalizan
-con medias y desviaciones ImageNet. En entrenamiento se añaden
-\texttt{RandomHorizontalFlip} y \texttt{ColorJitter}.
-
-Las corrupciones de entrenamiento se aplican con probabilidad 0.7 y se escogen
-entre ruido gaussiano, máscara de píxeles, cutout y blur. Para evaluación se
-define una suite estricta, determinista por generador semillado, con las
-severidades de la Tabla~\ref{tab:corruptions}.
-
-\begin{table}[h]
+\begin{table}[htbp]
 \centering
 \begin{tabular}{ll}
 \toprule
@@ -291,229 +163,353 @@ Corrupción & Severidades \\
 \texttt{blur} & 0.35, 0.6, 0.85 \\
 \bottomrule
 \end{tabular}
-\caption{Suite estricta de evaluación definida en el notebook.}
+\caption{Suite determinista de evaluación bajo corrupciones.}
 \label{tab:corruptions}
 \end{table}
 
-La evaluación mide precisión final, precisión del clasificador auxiliar,
-intervenciones beneficiosas, intervenciones dañinas, tasa de pareidolia,
-entropía del gate y estadísticas internas de \texttt{dq\_norm},
-\texttt{uncertainty}, \texttt{familiarity}, \texttt{conflict},
-\texttt{ood\_risk}, \texttt{gate\_prior}, \texttt{gate\_raw} y \texttt{gate}.
-El criterio de aceptación estricta exige simultáneamente:
+\subsection{Entrenamiento}
+
+E5 se entrena en tres fases. La fase 1 preentrena proyector, VQ y desproyector
+con reconstrucción latente, pérdida VQ y regularización SigReg. Se aplica
+masking de features de 35\% para forzar estabilidad de la memoria.
+
+La fase 2 congela la memoria latente e introduce atractor, gate y cabezas de
+clasificación. Cada lote se evalúa en versión limpia y corrupta. La fase 3
+entrena el sistema de forma conjunta con clasificación limpia/corrupta,
+denoising, VQ, regularización del gate, SigReg y una pérdida anti-pareidolia.
+
+La pérdida anti-pareidolia penaliza dos situaciones: gate alto con baja
+familiaridad y gate alto cuando el clasificador auxiliar acierta pero el modelo
+final falla. Este término no está diseñado para maximizar accuracy, sino para
+reducir intervenciones memorísticas dañinas.
+
+\subsection{Baselines}
+
+Se comparan tres condiciones ResNet18:
+\begin{enumerate}
+    \item \textbf{Frozen linear probe}: backbone ImageNet congelado y cabeza
+    lineal entrenable.
+    \item \textbf{Fine-tuned + augmentación}: backbone completo entrenable con
+    corrupciones aleatorias de entrenamiento.
+    \item \textbf{Fine-tuned corruptivo}: condición más agresiva con
+    \texttt{train\_corrupt\_prob=0.85}.
+\end{enumerate}
+
+La comparación con baselines fine-tuned es esencial porque define si el framework
+aporta algo más que una forma alternativa de usar capacidad paramétrica. Si un
+modelo con memoria congelada no supera a un baseline end-to-end, su contribución
+debe buscarse en auditabilidad, restricciones o eficiencia, no en accuracy
+absoluta.
+
+\section{Métricas}
+
+La métrica principal es accuracy limpia y accuracy corrupta promedio. El promedio
+corrupto se calcula promediando primero las severidades por tipo de corrupción y
+luego los cuatro tipos de corrupción.
+
+También se reportan métricas de calibración:
 \[
-\texttt{clean\_acc}\geq0.748252,\quad
-\texttt{corrupt\_acc\_avg}\geq0.399889,
+\text{ECE},\qquad \text{NLL},\qquad \text{Brier}.
 \]
-\[
-\texttt{gate\_order\_margin}\geq0.03,\quad
-\texttt{harmful\_changes}\leq0.006099,
-\]
-\[
-\texttt{pareidolia\_rate}\leq0.005922,\quad
-\texttt{gate\_raw\_mean}\leq0.95
-\]
-en limpio, blur y cutout. El margen de orden se define como:
-\[
-\texttt{gate\_order\_margin}
-=\min(\overline{g}_{blur},\overline{g}_{cutout})
--\overline{g}_{gaussian\ heavy}.
-\]
-La condición expresa la intención funcional de la memoria: abrir más para blur y
-cutout, cerrar más para ruido gaussiano severo.
+ECE mide desalineación entre confianza y acierto; NLL penaliza probabilidad baja
+en la clase correcta; Brier mide error cuadrático de la distribución predictiva.
+
+Para modelos Dememte se agregan métricas de intervención:
+\begin{itemize}
+    \item \textbf{Pred change rate}: fracción de muestras donde la predicción
+    final difiere de la predicción auxiliar.
+    \item \textbf{Beneficial changes}: cambios donde el auxiliar falla y la
+    salida final acierta.
+    \item \textbf{Harmful changes}: cambios donde el auxiliar acierta y la
+    salida final falla.
+    \item \textbf{Pareidolia rate}: casos con gate mayor que 0.5, auxiliar
+    correcto y salida final incorrecta.
+    \item \textbf{Gate mean/entropy}: intensidad y dispersión de la intervención
+    de memoria.
+\end{itemize}
+
+Estas métricas permiten distinguir entre robustez predictiva y seguridad de
+intervención. Una mejora en accuracy puede coexistir con más cambios dañinos; de
+igual forma, un mecanismo conservador puede reducir pareidolia pero sacrificar
+accuracy.
 
 \section{Resultados}
 
-El notebook no recomputa por defecto toda la suite; lee los artefactos finales
-ubicados bajo
-\texttt{experiments/VQ/out/artifacts/dememte\_attractor\_memory\_20260511\_115053/}.
-Los archivos usados son \texttt{attractor\_memory\_results.csv},
-\texttt{attractor\_signal\_curves.csv} y
-\texttt{e5\_combined\_dropout\_ood\_tau\_150\_best.pt}.
+\subsection{Comparación principal}
 
-\subsection{Comparación global}
+La Tabla~\ref{tab:main_results} muestra que E5 supera con amplitud al baseline
+congelado, pero no a ResNet18 fine-tuned con augmentación.
 
-La Tabla~\ref{tab:main_results} resume las métricas principales del CSV cargado
-por el notebook. E5 no es el modelo con mayor precisión limpia absoluta, pero es
-el único que satisface la aceptación estricta y alcanza el mayor promedio bajo
-corrupciones.
-
-\begin{table}[h]
+\begin{table}[htbp]
 \centering
-\small
-\begin{tabular}{lrrrrrrc}
+\scriptsize
+\begin{tabular}{lrrrrrr}
 \toprule
-Modelo & Clean & Corrupt & Gauss & Mask & Cutout & Blur & Strict \\
+Modelo & Clean & Corrupt & Gauss & Mask & Cutout & Blur \\
 \midrule
-ResNet18 baseline & 0.6993 & 0.2869 & 0.0707 & 0.0434 & 0.5173 & 0.5162 & No \\
-DeMemteAttractor & 0.7718 & 0.4207 & 0.2091 & 0.1219 & 0.6726 & 0.6791 & No \\
-E1 freeze VQ P3 & 0.4931 & 0.2178 & 0.0816 & 0.0733 & 0.3481 & 0.3684 & No \\
-E2 VQ clean-only P3 & 0.7671 & 0.3848 & 0.1348 & 0.0860 & 0.6415 & 0.6770 & No \\
-E3 dropout + low LR & 0.7795 & 0.4036 & 0.1880 & 0.1151 & 0.6516 & 0.6596 & No \\
-E4 OOD tau 0.75 & 0.7295 & 0.4083 & 0.2133 & 0.1412 & 0.6314 & 0.6475 & No \\
-E4 OOD tau 1.00 & 0.7759 & 0.4010 & 0.1686 & 0.0849 & 0.6683 & 0.6820 & No \\
-E4 OOD tau 1.50 & 0.7691 & 0.4228 & 0.2266 & 0.1513 & 0.6482 & 0.6649 & No \\
-\textbf{E5} & \textbf{0.7653} & \textbf{0.4313} & \textbf{0.2471} & \textbf{0.1628} & \textbf{0.6570} & \textbf{0.6584} & \textbf{Sí} \\
+ResNet18 frozen LP & 0.5620 & 0.2919 & 0.1440 & 0.1126 & 0.4640 & 0.4470 \\
+ResNet18 FT + aug & \textbf{0.8792} & \textbf{0.5781} & \textbf{0.3962} & 0.3060 & \textbf{0.7954} & \textbf{0.8148} \\
+DeMemte E5 & 0.8118 & 0.5213 & 0.3396 & \textbf{0.3157} & 0.7044 & 0.7254 \\
 \bottomrule
 \end{tabular}
-\caption{Resultados principales cargados desde \texttt{attractor\_memory\_results.csv}.}
+\caption{Resultados principales en Flowers102 bajo la suite corrupta.}
 \label{tab:main_results}
 \end{table}
 
-La comparación revela el intercambio central. El DeMemteAttractor base logra
-0.7718 en limpio y 0.4207 en corrupto promedio, pero falla el criterio de orden
-del gate y no supera la aceptación estricta. E3 y E4 corrigen parcialmente el
-ordenamiento, pero todavía fallan alguna condición de aceptación. E5 conserva
-precisión limpia por encima del piso, sube el promedio corrupto a 0.4313 y
-cumple el conjunto completo de restricciones.
+La brecha contra el frozen linear probe confirma que la memoria y el atractor
+aportan capacidad efectiva cuando el backbone no se actualiza. La brecha contra
+fine-tuning completo muestra, en cambio, que el framework no reemplaza la ventaja
+de adaptar todos los pesos del modelo.
 
-\subsection{Comportamiento de la compuerta}
-
-La Tabla~\ref{tab:gate_results} muestra por qué E5 es cualitativamente distinta.
-El modelo base tiene gate medio alrededor de 0.9 incluso en ruido gaussiano
-severo; por tanto, la memoria interviene casi siempre. E5 reduce el gate limpio
-a 0.2005 y el gate en gaussiano severo a 0.0887.
-
-\begin{table}[h]
+\begin{figure}[htbp]
 \centering
-\small
-\begin{tabular}{lrrrrrr}
-\toprule
-Modelo & Gate clean & Gate blur & Gate cutout & Gate gauss heavy & Margen & Pareidolia \\
-\midrule
-DeMemteAttractor & 0.8968 & 0.8935 & 0.9068 & 0.9225 & -0.0290 & 0.005380 \\
-E3 dropout + low LR & 0.3755 & 0.3832 & 0.3799 & 0.3047 & 0.0752 & 0.000867 \\
-E4 OOD tau 1.50 & 0.3710 & 0.3971 & 0.3639 & 0.1220 & 0.2419 & 0.001138 \\
-\textbf{E5} & \textbf{0.2005} & \textbf{0.2104} & \textbf{0.1976} & \textbf{0.0887} & \textbf{0.1089} & \textbf{0.000257} \\
-\bottomrule
-\end{tabular}
-\caption{Indicadores de gate y pareidolia en variantes clave.}
-\label{tab:gate_results}
-\end{table}
+\includegraphics[width=0.95\linewidth,height=0.34\textheight,keepaspectratio]{notebooks/01_baseline/out/plots/baseline_robustness_curves.png}
+\caption{Curvas de robustez de los baselines ResNet18.}
+\label{fig:baseline_curves}
+\end{figure}
+\FloatBarrier
 
-La reducción de pareidolia es particularmente relevante. E5 reporta
-\texttt{pareidolia\_rate=0.000257}, muy por debajo del máximo permitido
-0.005922. También mantiene \texttt{harmful\_changes=0.005895}, por debajo del
-umbral 0.006099. Estas dos cifras muestran que el aumento de robustez no se
-consigue mediante una memoria agresiva, sino mediante una intervención
-selectiva.
+\subsection{Calibración}
 
-\subsection{Curvas de severidad}
+La calibración no favorece a E5. En limpio, E5 obtiene
+\texttt{ECE\_clean=0.3592}, mientras que ResNet18 fine-tuned + augmentación
+obtiene 0.1720. En corrupto promedio, E5 obtiene 0.2611 frente a 0.1671 del
+baseline fine-tuned. El aumento de accuracy sobre el frozen probe no implica
+mejor calibración probabilística.
 
-El CSV de curvas internas confirma el mecanismo. En limpio, el gate medio de E5
-es 0.2005. En blur, aumenta ligeramente con la severidad hasta 0.2191; en cutout
-permanece cerca de 0.20 y baja a 0.1867 en severidad 0.5. En cambio, frente a
-ruido gaussiano pasa de 0.1536 a 0.1082 y finalmente a 0.0887. Frente a
-\texttt{pixel\_mask} severo, cae hasta 0.0405.
+Este resultado es importante para cualquier uso del gate como señal de decisión:
+si la confianza del clasificador no está calibrada, las señales derivadas de
+incertidumbre pueden requerir calibración explícita o post-procesamiento.
+
+\subsection{Dinámica del gate}
+
+La Tabla~\ref{tab:e5_curves} muestra que E5 reduce el gate frente a ruido
+gaussiano severo y lo mantiene más alto frente a blur. Este comportamiento es
+coherente con la idea de intervención selectiva, aunque no prueba causalmente que
+la compuerta sea óptima.
 
 \begin{longtable}{lrrrrr}
-\caption{Curvas principales de E5 por corrupción y severidad.}
+\caption{Curvas de E5 por corrupción y severidad.}
 \label{tab:e5_curves}\\
 \toprule
-Condición & Severidad & Acc & Gate & Gate raw & Familiarity \\
+Condición & Severidad & Acc & Gate & Familiarity & OOD risk \\
 \midrule
 \endfirsthead
 \toprule
-Condición & Severidad & Acc & Gate & Gate raw & Familiarity \\
+Condición & Severidad & Acc & Gate & Familiarity & OOD risk \\
 \midrule
 \endhead
-clean & 0.00 & 0.7653 & 0.2005 & 0.4604 & 0.3660 \\
-gaussian\_noise & 0.50 & 0.5053 & 0.1536 & 0.4667 & 0.2718 \\
-gaussian\_noise & 1.00 & 0.1857 & 0.1082 & 0.4612 & 0.1805 \\
-gaussian\_noise & 1.50 & 0.0504 & 0.0887 & 0.4577 & 0.1417 \\
-pixel\_mask & 0.25 & 0.3131 & 0.2035 & 0.4754 & 0.3698 \\
-pixel\_mask & 0.50 & 0.1379 & 0.1410 & 0.4671 & 0.2459 \\
-pixel\_mask & 0.75 & 0.0374 & 0.0405 & 0.4493 & 0.0428 \\
-cutout & 0.20 & 0.7497 & 0.2029 & 0.4593 & 0.3713 \\
-cutout & 0.35 & 0.6876 & 0.2031 & 0.4641 & 0.3713 \\
-cutout & 0.50 & 0.5336 & 0.1867 & 0.4682 & 0.3383 \\
-blur & 0.35 & 0.7367 & 0.2030 & 0.4561 & 0.3710 \\
-blur & 0.60 & 0.6783 & 0.2091 & 0.4585 & 0.3831 \\
-blur & 0.85 & 0.5601 & 0.2191 & 0.4700 & 0.4017 \\
+clean & 0.00 & 0.8118 & 0.2348 & 0.4399 & 0.0721 \\
+gaussian\_noise & 0.50 & 0.5531 & 0.2270 & 0.4254 & 0.0482 \\
+gaussian\_noise & 1.00 & 0.3381 & 0.1674 & 0.3054 & 0.0122 \\
+gaussian\_noise & 1.50 & 0.1275 & 0.1002 & 0.1686 & 0.0016 \\
+pixel\_mask & 0.25 & 0.4716 & 0.1824 & 0.3357 & 0.0487 \\
+pixel\_mask & 0.50 & 0.3319 & 0.1669 & 0.3037 & 0.0319 \\
+pixel\_mask & 0.75 & 0.1436 & 0.1762 & 0.3239 & 0.0138 \\
+cutout & 0.20 & 0.7964 & 0.2286 & 0.4273 & 0.0556 \\
+cutout & 0.35 & 0.7294 & 0.1936 & 0.3561 & 0.0307 \\
+cutout & 0.50 & 0.5874 & 0.1545 & 0.2771 & 0.0129 \\
+blur & 0.35 & 0.7944 & 0.2297 & 0.4303 & 0.0907 \\
+blur & 0.60 & 0.7440 & 0.2257 & 0.4219 & 0.0854 \\
+blur & 0.85 & 0.6377 & 0.2193 & 0.4080 & 0.0548 \\
 \bottomrule
 \end{longtable}
 
-El patrón es consistente con la intención del diseño: la familiaridad se mantiene
-razonable en blur y cutout, por lo que la memoria puede seguir aportando; en
-ruido gaussiano y máscara extrema, la familiaridad cae y el gate se cierra.
+La señal OOD guardada no aumenta con severidad gaussiana en estos artefactos; por
+el contrario, decrece. Por tanto, atribuir el cierre del gate exclusivamente al
+módulo OOD sería incorrecto. La reducción parece asociarse más directamente con
+familiaridad y con el prior compuesto.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth,height=0.34\textheight,keepaspectratio]{notebooks/02_e5_winner/out/gate_plots/gate_and_robustness.png}
+\caption{Respuesta del gate y accuracy de E5 bajo corrupciones.}
+\label{fig:e5_gate}
+\end{figure}
+\FloatBarrier
+
+\subsection{Seguridad de intervención}
+
+E5 presenta una tasa alta de cambio de predicción
+(\texttt{pred\_change\_rate=0.9935}), lo que indica que la ruta final rara vez
+coincide con el auxiliar. Aun así, los cambios dañinos promedio son bajos:
+\[
+\texttt{harmful\_changes}=0.0046,
+\qquad
+\texttt{pareidolia\_rate}=0.0003.
+\]
+Esto sugiere que la intervención de memoria es frecuente, pero no suele cumplir
+la definición estricta de pareidolia usada aquí. La interpretación debe ser
+cauta: una tasa baja de pareidolia no implica ausencia de errores inducidos bajo
+otras definiciones ni garantiza comportamiento seguro fuera de esta suite.
+
+\section{Ablaciones}
+
+Las ablaciones evalúan si los componentes de Dememte son necesarios y qué
+trade-offs introducen. La Tabla~\ref{tab:ablations} resume ocho variantes.
+
+\begin{table}[htbp]
+\centering
+\scriptsize
+\begin{tabular}{lrrrrrr}
+\toprule
+Variante & Clean & Corrupt & Gauss & Mask & Cutout & Blur \\
+\midrule
+ResNet18 transfer baseline & 0.8144 & \textbf{0.5488} & \textbf{0.3867} & 0.3134 & \textbf{0.7471} & \textbf{0.7480} \\
+No anti-pareidolia & 0.8216 & 0.5319 & 0.3532 & \textbf{0.3364} & 0.7111 & 0.7271 \\
+No OOD & 0.8157 & 0.5310 & 0.3622 & 0.3301 & 0.7020 & 0.7297 \\
+E5 completo & 0.8118 & 0.5213 & 0.3396 & 0.3157 & 0.7044 & 0.7254 \\
+Partial unfreeze backbone & \textbf{0.8608} & 0.5180 & 0.2770 & 0.2204 & 0.7643 & 0.8104 \\
+No familiarity & 0.7977 & 0.5141 & 0.3354 & 0.3032 & 0.7047 & 0.7130 \\
+Attractor disabled & 0.8026 & 0.5134 & 0.3309 & 0.3064 & 0.6984 & 0.7179 \\
+Freeze VQ Phase 3 & 0.4882 & 0.2410 & 0.1266 & 0.1168 & 0.3288 & 0.3916 \\
+\bottomrule
+\end{tabular}
+\caption{Ablaciones críticas de Dememte y baseline de transferencia.}
+\label{tab:ablations}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth,height=0.34\textheight,keepaspectratio]{notebooks/03_ablations/out/plots/ablations_clean_vs_corrupt.png}
+\caption{Comparación clean/corrupt de las variantes de ablación.}
+\label{fig:ablations}
+\end{figure}
+\FloatBarrier
+
+\subsection{Insights de ablación}
+
+\textbf{La memoria VQ necesita ajuste final.} Congelar VQ en fase 3 degrada el
+modelo a 0.4882 limpio y 0.2410 corrupto. Esta caída es mayor que cualquier otra
+ablación, lo que indica que la memoria latente no puede tratarse como módulo
+estático después del preentrenamiento.
+
+\textbf{OOD y anti-pareidolia no maximizan accuracy.} Quitar OOD sube el
+promedio corrupto de 0.5213 a 0.5310. Quitar anti-pareidolia lo sube a 0.5319.
+Esto no invalida esos componentes, pero sí cambia su interpretación: funcionan
+como restricciones o regularizadores de seguridad, no como mecanismos que
+optimicen directamente accuracy.
+
+\textbf{El atractor aporta poco en esta configuración.} Desactivar el atractor
+reduce el promedio corrupto de 0.5213 a 0.5134. La diferencia es positiva para
+E5, pero pequeña frente a la brecha contra fine-tuning completo. El atractor no
+aparece como el principal determinante de robustez.
+
+\textbf{Descongelar parte del backbone mejora limpio pero no robustez uniforme.}
+La variante con partial unfreeze alcanza 0.8608 limpio, pero cae a 0.2770 en
+gaussian y 0.2204 en pixel mask. Esto sugiere sobreajuste hacia corrupciones
+recuperables como blur/cutout o pérdida de robustez ante ruido destructivo.
+
+\textbf{El baseline de transferencia es competitivo.} La variante
+ResNet18 transfer baseline alcanza el mejor promedio corrupto del conjunto de
+ablaciones. Esto limita la afirmación de que la memoria explícita sea necesaria
+para robustez en este protocolo.
+
+\section{Comparación con fine-tuning agresivo}
+
+Una comparación adicional enfrenta una ResNet18 fine-tuned con corrupciones
+agresivas contra E5 congelado. En esta corrida, los resultados favorecen
+claramente al fine-tuning end-to-end.
+
+\begin{table}[htbp]
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+Condición & Clean & Corrupt & ECE clean & Gap clean-corrupt \\
+\midrule
+ResNet18 FT corruptivo & \textbf{0.8956} & \textbf{0.6835} & \textbf{0.0702} & 0.2121 \\
+DeMemte E5 frozen & 0.7657 & 0.4260 & 0.3925 & 0.3396 \\
+\bottomrule
+\end{tabular}
+\caption{Comparación entre fine-tuning completo y E5 con backbone congelado.}
+\label{tab:ft_vs_frozen}
+\end{table}
+
+Esta comparación rechaza, para los artefactos actuales, la hipótesis fuerte de
+que E5 rompe la frontera clean-corrupt frente a fine-tuning. El modelo
+fine-tuned domina en accuracy limpia, accuracy corrupta, calibración y gap.
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.95\linewidth,height=0.34\textheight,keepaspectratio]{notebooks/04_finetune_vs_frozen/out/plots/robustness_curves.png}
+\caption{Curvas de robustez de fine-tuning completo frente a E5 frozen.}
+\label{fig:ft_curves}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=0.72\linewidth,height=0.34\textheight,keepaspectratio]{notebooks/04_finetune_vs_frozen/out/plots/scatter_tradeoff.png}
+\caption{Relación entre accuracy limpia y corrupta en la comparación FT vs. E5.}
+\label{fig:scatter_tradeoff}
+\end{figure}
+\FloatBarrier
 
 \section{Discusión}
 
-La evolución desde DeMemteAttractor base hasta E5 puede entenderse como el paso
-de una memoria casi siempre activa a una memoria regulada por evidencia. El
-modelo base ya demuestra que el atractor puede mejorar robustez: supera al
-baseline ResNet18 tanto en limpio como bajo corrupciones. Sin embargo, sus
-métricas internas revelan un problema: \texttt{gate\_raw\_mean\_clean=0.9997} y
-valores equivalentes en blur y cutout. La compuerta cruda está saturada. En ese
-régimen, el prior puede modular, pero la red aprendida ya no expresa duda real.
+Los resultados separan tres niveles de contribución. En primer lugar, Dememte
+funciona como mecanismo de mejora sobre un backbone congelado: E5 supera
+ampliamente al frozen linear probe. En segundo lugar, Dememte no supera a
+baselines fuertes con fine-tuning completo; por tanto, no debe presentarse como
+mejor método de robustez predictiva en el protocolo actual. En tercer lugar,
+Dememte ofrece señales internas de intervención que los baselines estándar no
+proporcionan.
 
-E5 corrige esa saturación. Su \texttt{gate\_raw\_mean\_clean=0.4604},
-\texttt{gate\_raw\_mean\_blur=0.4615} y
-\texttt{gate\_raw\_mean\_cutout=0.4639}. Estos valores quedan muy por debajo del
-máximo de aceptación 0.95 y muestran que el MLP del gate permanece en una zona
-dinámica. La combinación de dropout, learning rate menor y regularización de
-entropía sobre \texttt{gate\_raw} permite esta desaturación.
+La diferencia entre robustez y auditabilidad es central. Un modelo fine-tuned
+puede ser más preciso, pero no distingue explícitamente entre predicción base,
+corrección de memoria y decisión de intervenir. Dememte sí lo hace, aunque esa
+estructura tiene un costo: más componentes, más hiperparámetros, mayor dificultad
+de calibración y menor accuracy que el fine-tuning completo observado.
 
-El segundo elemento decisivo es la calibración OOD. Con \texttt{ood\_tau=1.5} y
-\texttt{ood\_beta=8.0}, la señal de riesgo OOD se vuelve más selectiva. En vez
-de abrir la memoria ante cualquier dificultad, E5 diferencia dificultad
-recuperable de desviación no familiar. El resultado cuantitativo es el margen de
-orden 0.1089: blur y cutout reciben más gate que ruido gaussiano severo.
+Las ablaciones también muestran que no todos los componentes contribuyen de la
+misma forma. Algunos parecen necesarios para estabilidad, como el ajuste final de
+VQ. Otros son restricciones que sacrifican accuracy, como OOD y anti-pareidolia.
+Por ello, una evaluación justa de Dememte debe especificar si el objetivo es
+maximizar accuracy, minimizar intervención dañina, o estudiar mecanismos
+interpretables de memoria.
 
-El tercer elemento es el bloqueo de familiaridad. Al usar
-\texttt{familiarity\_width=0.5} y \texttt{phase3\_lock\_familiarity=True}, el
-entrenamiento final no puede resolver la presión de clasificación ensanchando
-artificialmente la región familiar. Esto es importante porque una familiaridad
-demasiado permisiva haría que el prior del gate permitiera intervención en
-entradas poco confiables.
+\section{Limitaciones}
 
-En conjunto, E5 no se limita a obtener una mejor cifra promedio. Su resultado es
-una solución más coherente con el objetivo del proyecto: usar memoria cuando
-ayuda y limitarla cuando puede causar errores inducidos. Por eso una variante
-como E3, con mayor precisión limpia, no es seleccionada como final: todavía no
-cumple todos los criterios estrictos. E5 gana porque equilibra precisión,
-robustez y seguridad de intervención.
+La evaluación usa una sola semilla principal. No hay estimación de varianza ni
+intervalos de confianza. Esto limita la fuerza estadística de las diferencias,
+especialmente cuando las brechas entre ablaciones son de pocos puntos.
 
-\section{Reproducibilidad}
+Las corrupciones son sintéticas. Gaussian noise, pixel mask, cutout y blur cubren
+algunos modos de degradación, pero no equivalen a shift real de dominio. No se
+evalúan cambios de distribución por cámara, iluminación natural, composición,
+taxonomía o estilos visuales.
 
-El notebook fija semilla 42 para \texttt{random}, \texttt{numpy}, \texttt{torch}
-y CUDA. Exige GPU explícitamente; si CUDA no está disponible, lanza un
-\texttt{RuntimeError}. Además, incluye dos interruptores:
-\texttt{RUN\_FULL\_EVAL=False} y \texttt{RUN\_TRAINING=False}. Con la
-configuración por defecto, la libreta actúa como documento reproducible de
-inspección: carga resultados y checkpoint sin ejecutar corridas largas. Si se
-activan esos flags, puede recomputar la suite completa o reentrenar la variante
-desde la fase 1.
+E5 tiene calibración deficiente frente a los baselines fine-tuned. Esto afecta
+tanto la interpretación de la confianza como el uso de incertidumbre dentro del
+gate. Sin calibración explícita, la compuerta puede ser interpretable en forma,
+pero no necesariamente confiable como señal probabilística.
 
-La carga del checkpoint se realiza mediante \texttt{load\_e5\_checkpoint}, que
-reconstruye el modelo E5 y carga el \texttt{state\_dict}. El
-\texttt{sanity\_check\_forward} verifica un batch pequeño y comprueba shapes de
-logits, gate, prior, gate crudo y finitud de SigReg. Este bloque garantiza que
-el checkpoint guardado corresponde a la definición arquitectónica del notebook.
+Existe una discrepancia entre artefactos: E5 aparece con 0.8118/0.5213 en una
+evaluación y como 0.7657/0.4260 en la comparación fine-tune vs. frozen. Esta
+diferencia debe resolverse antes de una publicación formal mediante rerun
+ordenado, hashes de checkpoints y registro completo de versiones.
+
+La métrica de pareidolia es operacional y estrecha. Solo cuenta casos con gate
+mayor que 0.5, auxiliar correcto y salida final incorrecta. Otras formas de error
+inducido por memoria podrían quedar fuera de esta definición.
 
 \section{Conclusión}
 
-\texttt{e5\_final\_clean.ipynb} consolida una variante final de
-DeMemteAttractor cuyo mérito principal es la regulación selectiva de una memoria
-latente. La arquitectura combina un backbone ResNet18 congelado, cuantización
-vectorial 2D, un atractor residual y una compuerta de ambigüedad basada en
-incertidumbre, familiaridad, conflicto y riesgo OOD. El entrenamiento en tres
-fases estabiliza primero la memoria, aprende después la interacción entre
-atractor y gate, y finalmente ajusta el sistema con clasificación limpia y
-corrupta más penalización anti-pareidolia.
+Dememte introduce un framework de memoria latente selectiva para clasificación
+robusta. Su instancia E5 combina ResNet18 congelada, memoria VQ, atractor
+residual y compuerta adaptativa basada en incertidumbre, familiaridad, conflicto
+y riesgo OOD. El framework permite medir no solo accuracy, sino también cuándo
+la memoria interviene y cuántas veces esa intervención es dañina.
 
-La variante ganadora E5 surge al calibrar explícitamente el cierre del gate:
-\texttt{ood\_tau=1.5}, \texttt{ood\_beta=8.0}, familiaridad más estrecha,
-familiaridad bloqueada en fase 3, dropout en el gate, menor tasa de aprendizaje
-del gate y regularización de entropía sobre \texttt{gate\_raw}. Esta combinación
-reduce saturación, mejora el orden funcional de la compuerta y mantiene baja la
-tasa de cambios dañinos.
+La evidencia actual no respalda una conclusión de superioridad absoluta. E5
+mejora sustancialmente sobre un backbone congelado, pero queda por debajo de
+ResNet18 fine-tuned con augmentación y de una condición de fine-tuning agresivo.
+Las ablaciones muestran que algunos mecanismos de seguridad reducen accuracy
+bruta y que baselines de transferencia siguen siendo competitivos.
 
-En los resultados guardados que el notebook carga, E5 alcanza 0.7653 de
-precisión limpia, 0.4313 de precisión corrupta promedio, 0.1089 de margen de
-orden del gate, 0.005895 de cambios dañinos y 0.000257 de pareidolia. Es la
-única variante listada con \texttt{strict\_acceptance\_success=True}. Por esa
-razón, dentro del marco experimental codificado en el notebook, E5 constituye la
-variante final ganadora.
+La contribución más sólida de Dememte es conceptual y diagnóstica: propone una
+forma explícita de estudiar memoria, corrección e intervención en modelos de
+visión. Para convertir esa contribución en una ventaja empírica fuerte, el
+siguiente paso debe incluir calibración, múltiples semillas, comparación con
+baselines más amplios y resolución de inconsistencias entre checkpoints.
 
 \end{document}
