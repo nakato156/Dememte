@@ -61,6 +61,7 @@ def _restore_requires_grad(previous):
 
 def configure_phase1(model: DeMemteAttractor) -> None:
     model.set_backbone_trainable(False)
+    model.backbone.eval()
     set_requires_grad(model.projector, True)
     set_requires_grad(model.vq, True)
     set_requires_grad(model.unprojector, True)
@@ -72,6 +73,7 @@ def configure_phase1(model: DeMemteAttractor) -> None:
 
 def configure_phase2(model: DeMemteAttractor) -> None:
     model.set_backbone_trainable(False)
+    model.backbone.eval()
     set_requires_grad(model.projector, False)
     set_requires_grad(model.vq, False)
     set_requires_grad(model.unprojector, False)
@@ -84,10 +86,13 @@ def configure_phase2(model: DeMemteAttractor) -> None:
     set_requires_grad(model.classifier, True)
 
 
-def configure_phase3(model: DeMemteAttractor, config) -> None:
+def configure_phase3(model: DeMemteAttractor, config, train_backbone: bool = False) -> None:
     model.set_backbone_trainable(False)
+    model.backbone.eval()
     if getattr(config, "phase3_backbone_train_mode", "frozen") == "partial_unfreeze":
         # layer4 of ResNet18 (Sequential[-1]) becomes trainable
+        if train_backbone:
+            model.backbone[-1].train()
         for p in model.backbone[-1].parameters():
             p.requires_grad = True
     memory_trainable = config.phase3_memory_grad_mode != "freeze_vq"
@@ -276,7 +281,7 @@ def _antipareidolia_loss(dbg_dirty, logits_dirty, y):
 
 def run_epoch_phase3(model, loader, optimizer, train, config, device, criterion, antipareidolia_weight):
     model.train(train)
-    configure_phase3(model, config)
+    configure_phase3(model, config, train_backbone=train)
     totals = {"loss": 0.0, "sigreg": 0.0, "acc": 0.0, "gate": 0.0, "gate_raw": 0.0, "gate_prior": 0.0, "n": 0}
     for x, y in loader:
         x = x.to(device, non_blocking=True)
@@ -338,7 +343,7 @@ def train_phase3(model, train_loader, val_loader, config, device, criterion=None
     criterion = criterion or nn.CrossEntropyLoss()
     if config.phase3_lock_familiarity:
         reset_gate_calibration_from_config(model, config)
-    configure_phase3(model, config)
+    configure_phase3(model, config, train_backbone=True)
     opt = make_optimizer_phase3(model, config)
     sch = optim.lr_scheduler.ReduceLROnPlateau(opt, mode="max", factor=config.scheduler_factor, patience=config.scheduler_patience)
     best_acc, best_state, no_imp = -1.0, copy.deepcopy(model.state_dict()), 0
@@ -364,6 +369,71 @@ def train_dememte_full(model, train_loader, val_loader, config, device, verbose=
     """Convenience driver: run phases 1, 2, 3 in order."""
     train_phase1(model, train_loader, val_loader, config, device, verbose=verbose)
     train_phase2(model, train_loader, val_loader, config, device, verbose=verbose)
+    return train_phase3(model, train_loader, val_loader, config, device, verbose=verbose)
+
+
+@torch.no_grad()
+def _legacy_sanity_forward(model, loader, config, device, verbose=True):
+    model.eval()
+    x, _ = next(iter(loader))
+    x = x[:4].to(device, non_blocking=True)
+    logits, denoise_loss, vq_loss, dbg = model(x, return_debug=True, update_ema=False)
+    sigreg_check = sigreg_latent_loss(dbg["z_completed"], config.weak_sigreg_sketch_dim)
+    if verbose:
+        print(
+            "logits:",
+            tuple(logits.shape),
+            "| gate:",
+            tuple(dbg["gate"].shape),
+            "| prior:",
+            tuple(dbg["gate_prior"].shape),
+            "| raw:",
+            tuple(dbg["gate_raw"].shape),
+            "| sigreg:",
+            float(sigreg_check),
+            "| denoise:",
+            float(denoise_loss),
+            "| vq:",
+            float(vq_loss),
+        )
+    assert logits.shape == (x.size(0), config.num_classes)
+    assert dbg["gate"].shape == (x.size(0), 1, 1, 1)
+    assert dbg["gate_prior"].shape == (x.size(0), 1, 1, 1)
+    assert dbg["gate_raw"].shape == (x.size(0), 1, 1, 1)
+    assert torch.isfinite(sigreg_check)
+
+
+@torch.no_grad()
+def _legacy_phase2_gate_sanity(model, loader, config, device, verbose=True):
+    model.eval()
+    x, _ = next(iter(loader))
+    x = x.to(device, non_blocking=True)
+    x_corrupt = apply_train_corruption(x.clone(), prob=config.train_corrupt_prob)
+    _, _, _, dbg = model(x_corrupt, return_debug=True, update_ema=False)
+    gate_mean = dbg["gate"].mean().item()
+    prior_mean = dbg["gate_prior"].mean().item()
+    raw_mean = dbg["gate_raw"].mean().item()
+    if verbose:
+        print("phase2 corrupt gate mean:", gate_mean, "| prior:", prior_mean, "| raw:", raw_mean)
+        if not (0.1 <= gate_mean <= 0.9):
+            print("WARNING: gate may be collapsed outside [0.1, 0.9].")
+    return gate_mean
+
+
+def train_dememte_critical(model, train_loader, val_loader, config, device, verbose=True):
+    """Run the E5 critical-protocol phase order used for the saved winner.
+
+    The historical notebook consumed one training-loader batch for a forward
+    sanity check before Phase 2 and one corrupted batch after Phase 2. Those
+    no-grad checks advance the DataLoader/RNG sequence, so reproducing the
+    training path means keeping them in the driver rather than treating them as
+    cosmetic notebook cells.
+    """
+    train_phase1(model, train_loader, val_loader, config, device, verbose=verbose)
+    reset_gate_calibration_from_config(model, config)
+    _legacy_sanity_forward(model, train_loader, config, device, verbose=verbose)
+    train_phase2(model, train_loader, val_loader, config, device, verbose=verbose)
+    _legacy_phase2_gate_sanity(model, train_loader, config, device, verbose=verbose)
     return train_phase3(model, train_loader, val_loader, config, device, verbose=verbose)
 
 
