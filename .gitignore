@@ -2,6 +2,7 @@ env/
 .venv*/
 data/
 out/
+*.pdf
 *.pth
 *.pt
 *.log
