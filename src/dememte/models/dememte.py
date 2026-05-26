@@ -1,170 +1,225 @@
-"""DeMemteAttractor — full model orchestrating ResNet backbone + VQ memory + gate."""
+"""DeMemte VQSA: ResNet backbone + vector quantization + self-attention fusion."""
 
 from __future__ import annotations
 
 import math
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from .attractor import AttractorMemory, AmbiguityGate
 from .baseline import make_backbone
-from .vq import LatentProjector, LatentUnprojector, VectorQuantizer2D, sigreg_latent_loss
+from .vq import LatentProjector, VectorQuantizer2D
 
 
-class DeMemteAttractor(nn.Module):
+class SelfAttentionBlock(nn.Module):
+    """Small encoder block that exposes attention maps for diagnostics."""
+
+    def __init__(self, dim: int, num_heads: int = 4, dropout: float = 0.1, mlp_ratio: float = 4.0):
+        super().__init__()
+        hidden = int(dim * mlp_ratio)
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.drop1 = nn.Dropout(dropout)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x_norm = self.norm1(x)
+        attn_out, attn_weights = self.attn(
+            x_norm,
+            x_norm,
+            x_norm,
+            need_weights=True,
+            average_attn_weights=False,
+        )
+        x = x + self.drop1(attn_out)
+        x = x + self.ffn(self.norm2(x))
+        return x, attn_weights
+
+
+class VQSAFusion(nn.Module):
+    """Quantize feature maps, fuse original/quantized descriptors, and refine by self-attention."""
+
+    VALID_FUSIONS = {"concat", "replace", "add"}
+
+    def __init__(
+        self,
+        in_channels: int = 512,
+        latent_dim: int = 256,
+        num_embeddings: int = 1024,
+        commitment_cost: float = 0.25,
+        vq_temperature: float = 1.0,
+        num_heads: int = 4,
+        num_layers: int = 2,
+        dropout: float = 0.1,
+        fusion_mode: str = "concat",
+        use_codebook: bool = True,
+        use_self_attention: bool = True,
+    ):
+        super().__init__()
+        if fusion_mode not in self.VALID_FUSIONS:
+            raise ValueError(f"Unknown VQSA fusion mode: {fusion_mode!r}. Choices: {sorted(self.VALID_FUSIONS)}")
+        self.latent_dim = latent_dim
+        self.fusion_mode = fusion_mode
+        self.use_codebook = bool(use_codebook)
+        self.use_self_attention = bool(use_self_attention)
+        self.projector = LatentProjector(in_channels, latent_dim)
+        self.vq = VectorQuantizer2D(num_embeddings, latent_dim, commitment_cost, vq_temperature)
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.attention = nn.ModuleList([
+            SelfAttentionBlock(latent_dim, num_heads=num_heads, dropout=dropout)
+            for _ in range(num_layers)
+        ])
+
+    def _zero_loss(self, z: torch.Tensor) -> torch.Tensor:
+        return z.sum() * 0.0
+
+    def _tokens_from_pooled(self, z_pool: torch.Tensor, zq_pool: torch.Tensor) -> torch.Tensor:
+        if self.fusion_mode == "concat":
+            return torch.stack([z_pool, zq_pool], dim=1)
+        if self.fusion_mode == "replace":
+            return torch.stack([zq_pool, zq_pool], dim=1)
+        fused = z_pool + zq_pool
+        return torch.stack([fused, fused], dim=1)
+
+    def forward(self, feats: torch.Tensor):
+        z = self.projector(feats)
+        if self.use_codebook:
+            zq, vq_loss, codebook_loss, commitment_loss, dq_map, soft_assign = self.vq(z)
+        else:
+            zq = z
+            vq_loss = codebook_loss = commitment_loss = self._zero_loss(z)
+            dq_map = torch.zeros(z.size(0), 1, z.size(2), z.size(3), device=z.device, dtype=z.dtype)
+            soft_assign = None
+
+        z_pool = self.pool(z).flatten(1)
+        zq_pool = self.pool(zq).flatten(1)
+        tokens = self._tokens_from_pooled(z_pool, zq_pool)
+        attn_weights: List[torch.Tensor] = []
+        if self.use_self_attention:
+            for block in self.attention:
+                tokens, weights = block(tokens)
+                attn_weights.append(weights)
+
+        fused = tokens.flatten(1)
+        debug = {
+            "z": z,
+            "zq": zq,
+            "z_pool": z_pool,
+            "zq_pool": zq_pool,
+            "tokens": tokens,
+            "attention_weights": torch.stack(attn_weights, dim=1) if attn_weights else None,
+            "vq_loss": vq_loss,
+            "codebook_loss": codebook_loss,
+            "commitment_loss": commitment_loss,
+            "dq_map": dq_map,
+            "soft_assign": soft_assign,
+        }
+        return fused, debug
+
+
+class DeMemteVQSA(nn.Module):
+    """Strict VQSA classifier for quality-independent feature learning."""
+
     def __init__(
         self,
         backbone: nn.Module,
         num_classes: int = 102,
-        latent_dim: int = 128,
+        latent_dim: int = 256,
         num_embeddings: int = 1024,
-        attractor_hidden: int = 512,
-        gate_hidden: int = 16,
         commitment_cost: float = 0.25,
         vq_temperature: float = 1.0,
-        familiarity_midpoint: float = 0.0,
-        familiarity_width: float = 1.0,
-        ood_tau: float = 2.0,
-        ood_beta: float = 4.0,
-        gate_init_prob: float = 0.1,
-        gate_prior_floor: float = 0.02,
-        gate_dropout: float = 0.0,
-        use_uncertainty: bool = True,
-        use_familiarity: bool = True,
-        use_conflict: bool = True,
-        use_ood: bool = True,
-        disable_attractor: bool = False,
+        vqsa_heads: int = 4,
+        vqsa_layers: int = 2,
+        vqsa_dropout: float = 0.1,
+        vqsa_fusion_mode: str = "concat",
+        vqsa_use_codebook: bool = True,
+        vqsa_use_self_attention: bool = True,
     ):
         super().__init__()
         self.backbone = backbone
-        self.projector = LatentProjector(512, latent_dim)
-        self.vq = VectorQuantizer2D(num_embeddings, latent_dim, commitment_cost, vq_temperature)
-        self.attractor = AttractorMemory(latent_dim, attractor_hidden)
-        self.gate = AmbiguityGate(
-            num_classes=num_classes,
+        self.vqsa = VQSAFusion(
+            in_channels=512,
+            latent_dim=latent_dim,
             num_embeddings=num_embeddings,
-            hidden=gate_hidden,
-            familiarity_midpoint=familiarity_midpoint,
-            familiarity_width=familiarity_width,
-            ood_tau=ood_tau,
-            ood_beta=ood_beta,
-            gate_init_prob=gate_init_prob,
-            gate_prior_floor=gate_prior_floor,
-            gate_dropout=gate_dropout,
-            use_uncertainty=use_uncertainty,
-            use_familiarity=use_familiarity,
-            use_conflict=use_conflict,
-            use_ood=use_ood,
+            commitment_cost=commitment_cost,
+            vq_temperature=vq_temperature,
+            num_heads=vqsa_heads,
+            num_layers=vqsa_layers,
+            dropout=vqsa_dropout,
+            fusion_mode=vqsa_fusion_mode,
+            use_codebook=vqsa_use_codebook,
+            use_self_attention=vqsa_use_self_attention,
         )
-        self.unprojector = LatentUnprojector(latent_dim, 512)
-        self.aux_classifier = nn.Linear(512, num_classes)
-        self.classifier = nn.Linear(512, num_classes)
-        self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.disable_attractor = bool(disable_attractor)
+        self.classifier = nn.Sequential(
+            nn.Linear(2 * latent_dim, 512),
+            nn.GELU(),
+            nn.Dropout(vqsa_dropout),
+            nn.Linear(512, num_classes),
+        )
+
+    @property
+    def projector(self) -> LatentProjector:
+        return self.vqsa.projector
+
+    @property
+    def vq(self) -> VectorQuantizer2D:
+        return self.vqsa.vq
 
     def set_backbone_trainable(self, trainable: bool) -> None:
         for p in self.backbone.parameters():
             p.requires_grad = trainable
-
-    def _mask_features(self, feats: torch.Tensor, mask_ratio: float) -> torch.Tensor:
-        if mask_ratio <= 0:
-            return feats
-        b, _, h, w = feats.shape
-        keep = (torch.rand(b, 1, h, w, device=feats.device) > mask_ratio).float()
-        return feats * keep
 
     def encode_z(self, x: torch.Tensor):
         feats = self.backbone(x)
         z = self.projector(feats)
         return feats, z
 
-    def pretrain_latent(self, x: torch.Tensor, feature_mask_ratio: float = 0.0, update_ema: bool = True, sigreg_sketch_dim: int = 64):
+    def forward(self, x: torch.Tensor, return_debug: bool = False, **_):
         feats = self.backbone(x)
-        vq_input = self._mask_features(feats, feature_mask_ratio if self.training else 0.0)
-        z = self.projector(vq_input)
-        zq, vq_loss, dq_map, soft_assign = self.vq(z)
-        rec_feats = self.unprojector(zq)
-        if self.training and update_ema:
-            aux_logits = self.aux_classifier(self.pool(feats).flatten(1))
-            self.gate(aux_logits, dq_map, soft_assign, update_ema=True)
-        recon_loss = F.mse_loss(rec_feats, feats.detach())
-        sigreg_loss = sigreg_latent_loss(z, sigreg_sketch_dim)
-        return recon_loss, vq_loss, sigreg_loss
-
-    def forward(self, x: torch.Tensor, target_z=None, update_ema: bool = True, return_debug: bool = False, feature_mask_ratio: float = 0.0):
-        feats = self.backbone(x)
-        vq_feats = self._mask_features(feats, feature_mask_ratio if self.training else 0.0)
-        z = self.projector(vq_feats)
-        zq, vq_loss, dq_map, soft_assign = self.vq(z)
-        z_completed = z if self.disable_attractor else self.attractor(z)
-        delta = z_completed - z.detach()
-
-        feats_flat = self.pool(feats).flatten(1)
-        aux_logits = self.aux_classifier(feats_flat)
-        gate, signals = self.gate(aux_logits, dq_map, soft_assign, update_ema=update_ema)
-
-        z_final = z + gate * delta
-        feats_final = self.unprojector(z_final)
-        logits = self.classifier(self.pool(feats_final).flatten(1))
-        target = z.detach() if target_z is None else target_z.detach()
-        denoise_loss = F.mse_loss(z_completed, target)
-
+        fused, debug = self.vqsa(feats)
+        logits = self.classifier(fused)
         if return_debug:
-            debug = {
-                "gate": gate,
-                "delta": delta,
-                "z": z,
-                "z_completed": z_completed,
-                "dq_map": dq_map,
-                "logits_base": aux_logits,
-                "clean_feats": feats,
-                "enhanced_feats": feats_final,
-                **signals,
-            }
-            return logits, denoise_loss, vq_loss, debug
-        return logits, denoise_loss, vq_loss
+            debug = {**debug, "features": feats, "fused": fused}
+            return logits, debug["vq_loss"], debug
+        return logits
 
 
-def make_dememte_variant(config, device: str = "cuda") -> DeMemteAttractor:
-    """Build a DeMemteAttractor from an E5Config / AblationConfig."""
-    model = DeMemteAttractor(
+def make_dememte_variant(config, device: str = "cuda") -> DeMemteVQSA:
+    """Build the strict VQSA DeMemte variant from an E5/Ablation config."""
+    model = DeMemteVQSA(
         backbone=make_backbone(),
         num_classes=config.num_classes,
         latent_dim=config.latent_dim,
         num_embeddings=config.num_embeddings,
-        attractor_hidden=config.attractor_hidden,
-        gate_hidden=config.gate_hidden,
         commitment_cost=config.commitment_cost,
         vq_temperature=config.vq_temperature,
-        familiarity_midpoint=config.familiarity_midpoint,
-        familiarity_width=config.familiarity_width,
-        ood_tau=config.ood_tau,
-        ood_beta=config.ood_beta,
-        gate_init_prob=config.gate_init_prob,
-        gate_prior_floor=config.gate_prior_floor,
-        gate_dropout=config.gate_dropout,
-        use_uncertainty=config.use_uncertainty,
-        use_familiarity=config.use_familiarity,
-        use_conflict=config.use_conflict,
-        use_ood=config.use_ood,
-        disable_attractor=config.disable_attractor,
+        vqsa_heads=config.vqsa_heads,
+        vqsa_layers=config.vqsa_layers,
+        vqsa_dropout=config.vqsa_dropout,
+        vqsa_fusion_mode=config.vqsa_fusion_mode,
+        vqsa_use_codebook=config.vqsa_use_codebook,
+        vqsa_use_self_attention=config.vqsa_use_self_attention,
     ).to(device)
-    model.set_backbone_trainable(False)
+    model.set_backbone_trainable(bool(getattr(config, "vqsa_train_backbone", False)))
     return model
 
 
-def make_dememte_e5(config=None, device: str = "cuda") -> DeMemteAttractor:
-    """Convenience: build the E5 winner with default config if none provided."""
+def make_dememte_e5(config=None, device: str = "cuda") -> DeMemteVQSA:
+    """Convenience: build the strict VQSA default config if none is provided."""
     from ..config import E5Config
     return make_dememte_variant(config or E5Config(), device=device)
 
 
-def reset_gate_calibration_from_config(model: DeMemteAttractor, config) -> None:
-    with torch.no_grad():
-        model.gate.midpoint.fill_(float(config.familiarity_midpoint))
-        model.gate.log_width.fill_(math.log(float(config.familiarity_width)))
-    model.gate.ood_tau = float(config.ood_tau)
-    model.gate.ood_beta = float(config.ood_beta)
-    model.gate.gate_prior_floor = float(config.gate_prior_floor)
+def attention_entropy(attention_weights: torch.Tensor | None) -> torch.Tensor:
+    if attention_weights is None:
+        return torch.tensor(0.0)
+    probs = attention_weights.clamp_min(1e-8)
+    return -(probs * probs.log()).sum(dim=-1).mean() / math.log(probs.size(-1))

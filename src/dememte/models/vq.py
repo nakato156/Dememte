@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 
 class VectorQuantizer2D(nn.Module):
-    """Spatial VQ with straight-through estimator and soft assignment outputs."""
+    """Spatial VQ with straight-through estimator and diagnostic losses."""
 
     def __init__(self, num_embeddings: int, embedding_dim: int, commitment_cost: float = 0.25, temperature: float = 1.0):
         super().__init__()
@@ -29,12 +29,14 @@ class VectorQuantizer2D(nn.Module):
         one_hot = F.one_hot(idx, self.num_embeddings).type(flat.dtype)
         q_flat = one_hot @ emb
         q = q_flat.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
-        vq_loss = self.commitment_cost * F.mse_loss(z_e, q.detach()) + F.mse_loss(q, z_e.detach())
+        commitment_loss = F.mse_loss(z_e, q.detach())
+        codebook_loss = F.mse_loss(q, z_e.detach())
+        vq_loss = codebook_loss + self.commitment_cost * commitment_loss
         q_st = z_e + (q - z_e).detach()
         dq_map = ((z_e - q.detach()) ** 2).mean(dim=1, keepdim=True)
         temp = max(1e-6, float(self.temperature))
         soft_assign = F.softmax(-distances / temp, dim=1).view(b, h, w, self.num_embeddings)
-        return q_st, vq_loss, dq_map, soft_assign
+        return q_st, vq_loss, codebook_loss, commitment_loss, dq_map, soft_assign
 
 
 class LatentProjector(nn.Module):

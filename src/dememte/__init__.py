@@ -1,4 +1,4 @@
-"""DeMemte: shared library for baseline, E5 winner, ablations, and FT-vs-frozen notebooks."""
+"""DeMemte: strict VQSA models, baselines, data, and experiment helpers."""
 
 from .config import BaselineConfig, E5Config, AblationConfig
 from .data import build_loaders, seed_everything

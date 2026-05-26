@@ -1,8 +1,4 @@
-"""Evaluation: clean accuracy, paired corruption suite, gate/calibration metrics.
-
-Mirrors `evaluate_extended` + `evaluate_attractor_suite` from `Dememte_e5y.ipynb`.
-Provides a simpler `evaluate_baseline_suite` for the plain ResNet baseline.
-"""
+"""Evaluation: clean accuracy, paired corruption suite, and VQSA diagnostics."""
 
 from __future__ import annotations
 
@@ -15,7 +11,15 @@ import torch.nn.functional as F
 from .corruptions import STRICT_SUITE, apply_eval_corruption
 
 
-SIGNAL_KEYS = ["dq_norm", "uncertainty", "familiarity", "conflict", "ood_risk", "gate_prior", "gate_raw", "gate"]
+VQSA_KEYS = [
+    "vq_loss",
+    "codebook_loss",
+    "commitment_loss",
+    "dq_mean",
+    "assignment_entropy",
+    "codebook_perplexity",
+    "attention_entropy",
+]
 
 
 def _trapezoid(y, x=None, dx=1.0, axis=-1):
@@ -68,8 +72,41 @@ def _risk_coverage_auc(scores, corrects):
     return {"aurc": aurc, "coverage_at_5pct_risk": float(ok.max()) if ok.size else 0.0}
 
 
+def _vqsa_batch_diagnostics(dbg: dict, batch_size: int) -> dict:
+    device = dbg["z"].device
+    scalar = lambda value: torch.full((batch_size,), float(value.detach().item()), device=device)
+    dq_mean = dbg["dq_map"].flatten(1).mean(dim=1).detach()
+
+    soft_assign = dbg.get("soft_assign")
+    if soft_assign is None:
+        assignment_entropy = torch.zeros(batch_size, device=device)
+        codebook_perplexity = torch.zeros(batch_size, device=device)
+    else:
+        probs = soft_assign.clamp_min(1e-8)
+        entropy = -(probs * probs.log()).sum(dim=-1).mean(dim=(1, 2)).detach()
+        assignment_entropy = entropy / np.log(probs.size(-1))
+        codebook_perplexity = entropy.exp()
+
+    attn = dbg.get("attention_weights")
+    if attn is None:
+        attention_entropy = torch.zeros(batch_size, device=device)
+    else:
+        probs = attn.clamp_min(1e-8)
+        attention_entropy = (-(probs * probs.log()).sum(dim=-1).mean(dim=(1, 2, 3)) / np.log(probs.size(-1))).detach()
+
+    return {
+        "vq_loss": scalar(dbg["vq_loss"]),
+        "codebook_loss": scalar(dbg["codebook_loss"]),
+        "commitment_loss": scalar(dbg["commitment_loss"]),
+        "dq_mean": dq_mean,
+        "assignment_entropy": assignment_entropy,
+        "codebook_perplexity": codebook_perplexity,
+        "attention_entropy": attention_entropy,
+    }
+
+
 # ---------------------------------------------------------------------------
-# DeMemte evaluation
+# DeMemte VQSA evaluation
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
@@ -84,14 +121,8 @@ def evaluate_dememte(
 ):
     model.eval()
     total = 0
-    final_correct = 0
-    base_correct = 0
-    pred_changed = 0
-    beneficial = 0
-    harmful = 0
-    pareidolia = 0
-    gate_values, gate_entropy_values = [], []
-    signal_values = {k: [] for k in SIGNAL_KEYS}
+    correct = 0
+    diag_values = {k: [] for k in VQSA_KEYS}
     conf_all, corr_all, nll_all, brier_all = [], [], [], []
     prediction_rows = []
 
@@ -104,80 +135,51 @@ def evaluate_dememte(
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         x_eval = apply_eval_corruption(x, corruption, severity, g)
-        logits, _, _, dbg = model(x_eval, return_debug=True, update_ema=False)
-        logits_base = dbg["logits_base"]
+        logits, _, dbg = model(x_eval, return_debug=True)
         probs = torch.softmax(logits, dim=1)
         conf, pred = probs.max(1)
-        base_pred = logits_base.argmax(1)
-        final_ok = pred == y
-        base_ok = base_pred == y
-        changed = pred != base_pred
+        ok = pred == y
         y_prob = probs.gather(1, y.view(-1, 1)).squeeze(1).clamp_min(1e-12)
         one_hot = F.one_hot(y, num_classes=probs.size(1)).float()
         brier = ((probs - one_hot) ** 2).sum(dim=1)
+        diagnostics = _vqsa_batch_diagnostics(dbg, y.size(0))
 
-        final_correct += final_ok.sum().item()
-        base_correct += base_ok.sum().item()
-        pred_changed += changed.sum().item()
-        beneficial += (changed & (~base_ok) & final_ok).sum().item()
-        harmful += (changed & base_ok & (~final_ok)).sum().item()
-        gate_flat = dbg["gate"].view(-1).detach()
-        pareidolia += ((gate_flat > 0.5) & base_ok & (~final_ok)).sum().item()
-        gclip = gate_flat.clamp(1e-6, 1.0 - 1e-6)
-        gate_entropy = -(gclip * torch.log(gclip) + (1.0 - gclip) * torch.log(1.0 - gclip))
-        gate_entropy_values.append(gate_entropy.cpu())
-        gate_values.append(gate_flat.cpu())
-        for key in SIGNAL_KEYS:
-            signal_values[key].append(dbg[key].view(-1).detach().cpu())
         total += y.size(0)
+        correct += ok.sum().item()
         conf_all.extend(conf.detach().cpu().tolist())
-        corr_all.extend(final_ok.detach().cpu().tolist())
+        corr_all.extend(ok.detach().cpu().tolist())
         nll_all.extend((-torch.log(y_prob)).detach().cpu().tolist())
         brier_all.extend(brier.detach().cpu().tolist())
+        for key in VQSA_KEYS:
+            diag_values[key].append(diagnostics[key].detach().cpu())
 
         if return_predictions:
             for j in range(y.size(0)):
-                prediction_rows.append({
+                row = {
                     "sample_id": sample_offset + j,
                     "corruption": "clean" if corruption is None else corruption,
                     "severity": float(severity),
                     "target": int(y[j].item()),
                     "pred": int(pred[j].item()),
-                    "base_pred": int(base_pred[j].item()),
-                    "correct": bool(final_ok[j].item()),
-                    "base_correct": bool(base_ok[j].item()),
+                    "correct": bool(ok[j].item()),
                     "confidence": float(conf[j].item()),
-                    "gate": float(gate_flat[j].item()),
-                    "gate_raw": float(dbg["gate_raw"].view(-1)[j].item()),
-                    "familiarity": float(dbg["familiarity"].view(-1)[j].item()),
-                    "ood_risk": float(dbg["ood_risk"].view(-1)[j].item()),
-                    "dq_norm": float(dbg["dq_norm"].view(-1)[j].item()),
-                    "gate_entropy": float(gate_entropy[j].item()),
                     "nll": float(-torch.log(y_prob[j]).item()),
                     "brier": float(brier[j].item()),
-                })
+                }
+                for key in VQSA_KEYS:
+                    row[key] = float(diagnostics[key][j].item())
+                prediction_rows.append(row)
             sample_offset += y.size(0)
 
-    gates = torch.cat(gate_values) if gate_values else torch.empty(0)
-    gate_entropy_cat = torch.cat(gate_entropy_values) if gate_entropy_values else torch.empty(0)
     rc_conf = _risk_coverage_auc(conf_all, corr_all)
-    rc_gate = _risk_coverage_auc(gates.numpy().tolist() if gates.numel() else [], corr_all)
     result = {
-        "acc": final_correct / max(1, total),
-        "base_acc": base_correct / max(1, total),
-        "gate_mean": gates.mean().item() if gates.numel() else 0.0,
-        "pred_change_rate": pred_changed / max(1, total),
-        "beneficial_changes": beneficial / max(1, total),
-        "harmful_changes": harmful / max(1, total),
-        "pareidolia_rate": pareidolia / max(1, total),
-        "gate_entropy": gate_entropy_cat.mean().item() if gate_entropy_cat.numel() else 0.0,
+        "acc": correct / max(1, total),
         "ece": _compute_ece(conf_all, corr_all),
         "nll": float(np.mean(nll_all)) if nll_all else 0.0,
         "brier": float(np.mean(brier_all)) if brier_all else 0.0,
         "aurc_confidence": rc_conf["aurc"],
-        "aurc_gate": rc_gate["aurc"],
     }
-    for key, values in signal_values.items():
+    for key, values in diag_values.items():
         result.update(_signal_summary(values, key))
     if return_predictions:
         result["predictions"] = prediction_rows
@@ -189,20 +191,16 @@ def evaluate_dememte_suite(model, loader, device="cuda", return_predictions=Fals
     clean = evaluate_dememte(model, loader, device=device, corruption=None, severity=0.0, return_predictions=return_predictions)
     corrupt_records = {}
     for corr, levels in suite.items():
-        corrupt_records[corr] = [evaluate_dememte(model, loader, device=device, corruption=corr, severity=l, return_predictions=return_predictions) for l in levels]
+        corrupt_records[corr] = [
+            evaluate_dememte(model, loader, device=device, corruption=corr, severity=l, return_predictions=return_predictions)
+            for l in levels
+        ]
     acc_by_corr = {f"corrupt_acc_{c}": float(np.mean([r["acc"] for r in rows])) for c, rows in corrupt_records.items()}
     all_corrupt = [r for rows in corrupt_records.values() for r in rows]
-    corrupt_acc_avg = float(np.mean(list(acc_by_corr.values())))
     metrics = {
         "clean_acc": clean["acc"],
-        "corrupt_acc_avg": corrupt_acc_avg,
+        "corrupt_acc_avg": float(np.mean(list(acc_by_corr.values()))),
         **acc_by_corr,
-        "gate_mean_clean": clean["gate_mean"],
-        "pred_change_rate": float(np.mean([r["pred_change_rate"] for r in all_corrupt])),
-        "beneficial_changes": float(np.mean([r["beneficial_changes"] for r in all_corrupt])),
-        "harmful_changes": float(np.mean([r["harmful_changes"] for r in all_corrupt])),
-        "pareidolia_rate": float(np.mean([r["pareidolia_rate"] for r in all_corrupt])),
-        "gate_entropy": clean["gate_entropy"],
         "ece_clean": clean["ece"],
         "ece_corrupt_avg": float(np.mean([r["ece"] for r in all_corrupt])),
         "nll_clean": clean["nll"],
@@ -212,6 +210,9 @@ def evaluate_dememte_suite(model, loader, device="cuda", return_predictions=Fals
         "corruption_records": corrupt_records,
         "clean_record": clean,
     }
+    for key in VQSA_KEYS:
+        metrics[f"{key}_clean"] = clean[f"{key}_mean"]
+        metrics[f"{key}_corrupt_avg"] = float(np.mean([r[f"{key}_mean"] for r in all_corrupt]))
     return metrics
 
 
@@ -293,7 +294,10 @@ def evaluate_baseline_suite(model, loader, device="cuda", return_predictions=Fal
     clean = evaluate_baseline(model, loader, device=device, return_predictions=return_predictions)
     corrupt_records = {}
     for corr, levels in suite.items():
-        corrupt_records[corr] = [evaluate_baseline(model, loader, device=device, corruption=corr, severity=l, return_predictions=return_predictions) for l in levels]
+        corrupt_records[corr] = [
+            evaluate_baseline(model, loader, device=device, corruption=corr, severity=l, return_predictions=return_predictions)
+            for l in levels
+        ]
     acc_by_corr = {f"corrupt_acc_{c}": float(np.mean([r["acc"] for r in rows])) for c, rows in corrupt_records.items()}
     all_corrupt = [r for rows in corrupt_records.values() for r in rows]
     metrics = {
