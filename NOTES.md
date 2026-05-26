@@ -787,3 +787,50 @@ Proximos pasos recomendados:
   - robustez predictiva pura;
   - seguridad/auditabilidad de intervencion memoristica.
 - Si se quiere competir en accuracy, comparar contra fine-tuning completo como baseline principal, no solo contra frozen linear probe.
+
+## Actualizacion: experimento oracle gate
+
+Se agrego `notebooks/05_oracle_gate/oracle_gate.ipynb` como diagnostico post-hoc. El notebook no reentrena ni regenera los notebooks 01-04; lee `notebooks/02_e5_winner/out/predictions.csv` y escribe solo en `notebooks/05_oracle_gate/out/`.
+
+Objetivo: medir el upper bound de un gate perfecto. Para cada muestra corrupta compara:
+
+- prediccion auxiliar/base: `base_pred`;
+- prediccion con memoria: `pred`;
+- label real: `target`;
+- efecto de memoria: `helps`, `hurts` o `no_change`;
+- `oracle_correct = base_correct OR correct`.
+
+Resultados overall en muestras corruptas:
+
+| Metrica | Valor |
+|---|---:|
+| `base_acc` | 0.008660 |
+| `memory_acc` | 0.521264 |
+| `oracle_acc` | 0.525871 |
+| `oracle_gain_vs_memory` | +0.004608 |
+| `oracle_gain_vs_base` | +0.517211 |
+| `helps_rate` | 0.517211 |
+| `hurts_rate` | 0.004608 |
+| `no_change_rate` | 0.478181 |
+
+Comparacion contra fine-tuning corruptivo del notebook 04:
+
+| Modelo | Corrupt acc avg |
+|---|---:|
+| ResNet18 FT corruptivo | 0.6897 |
+| DeMemte E5 memoria | 0.5213 |
+| Oracle gate E5 | 0.5259 |
+
+Lectura:
+
+- El oracle gate solo recupera `+0.46 pp` sobre la memoria actual.
+- Aun con un gate perfecto, E5 queda `~16.4 pp` por debajo del baseline ResNet18 fine-tuned con corrupciones.
+- Por tanto, el cuello de botella no es principalmente la calibracion/aprendizaje del gate.
+- La correccion de memoria no tiene suficiente capacidad util bajo este protocolo para competir con FT corruptivo.
+- Seguir optimizando thresholds, senales o regularizacion del gate tiene techo bajo si la arquitectura de memoria/correccion no mejora.
+
+Decision experimental:
+
+- Si el objetivo es accuracy robusta, no vale la pena seguir optimizando solo el gate actual; hay que mejorar la capacidad de la memoria/attractor, la representacion latente o el entrenamiento de la rama de correccion.
+- Si el objetivo es defender DeMemte, el claim mas seguro es auditabilidad/selectividad/diagnostico de intervencion, no superar fine-tuning corruptivo en robustez bruta.
+- El baseline FT corruptivo debe quedar como comparador principal para cualquier claim de accuracy.
