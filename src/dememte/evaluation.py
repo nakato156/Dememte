@@ -18,6 +18,9 @@ VQSA_KEYS = [
     "dq_mean",
     "assignment_entropy",
     "codebook_perplexity",
+    "hard_usage",
+    "hard_perplexity",
+    "dead_code_fraction",
     "attention_entropy",
 ]
 
@@ -94,6 +97,28 @@ def _vqsa_batch_diagnostics(dbg: dict, batch_size: int) -> dict:
         probs = attn.clamp_min(1e-8)
         attention_entropy = (-(probs * probs.log()).sum(dim=-1).mean(dim=(1, 2, 3)) / np.log(probs.size(-1))).detach()
 
+    hard_usage = torch.zeros(batch_size, device=device)
+    hard_perplexity = torch.zeros(batch_size, device=device)
+    dead_code_fraction = torch.zeros(batch_size, device=device)
+    indices = dbg.get("encoding_indices")
+    num_embeddings = int(dbg.get("num_embeddings", 0) or 0)
+    if indices is not None and num_embeddings > 0:
+        per_sample = indices.detach().reshape(batch_size, -1).long()
+        usage_rows = []
+        perplexity_rows = []
+        dead_rows = []
+        for sample_idx in per_sample:
+            counts = torch.bincount(sample_idx, minlength=num_embeddings).float()
+            used = counts > 0
+            probs = counts / counts.sum().clamp_min(1.0)
+            entropy = -(probs[used] * probs[used].clamp_min(1e-8).log()).sum()
+            usage_rows.append(used.float().mean())
+            perplexity_rows.append(entropy.exp())
+            dead_rows.append((~used).float().mean())
+        hard_usage = torch.stack(usage_rows).to(device)
+        hard_perplexity = torch.stack(perplexity_rows).to(device)
+        dead_code_fraction = torch.stack(dead_rows).to(device)
+
     return {
         "vq_loss": scalar(dbg["vq_loss"]),
         "codebook_loss": scalar(dbg["codebook_loss"]),
@@ -101,7 +126,39 @@ def _vqsa_batch_diagnostics(dbg: dict, batch_size: int) -> dict:
         "dq_mean": dq_mean,
         "assignment_entropy": assignment_entropy,
         "codebook_perplexity": codebook_perplexity,
+        "hard_usage": hard_usage,
+        "hard_perplexity": hard_perplexity,
+        "dead_code_fraction": dead_code_fraction,
         "attention_entropy": attention_entropy,
+    }
+
+
+def _add_global_hard_counts(counts: torch.Tensor | None, dbg: dict) -> torch.Tensor | None:
+    indices = dbg.get("encoding_indices")
+    num_embeddings = int(dbg.get("num_embeddings", 0) or 0)
+    if indices is None or num_embeddings <= 0:
+        return counts
+    batch_counts = torch.bincount(indices.detach().reshape(-1).long().cpu(), minlength=num_embeddings).float()
+    if counts is None:
+        return batch_counts
+    if counts.numel() < batch_counts.numel():
+        padded = torch.zeros_like(batch_counts)
+        padded[: counts.numel()] = counts
+        counts = padded
+    counts[: batch_counts.numel()] += batch_counts
+    return counts
+
+
+def _global_hard_summary(counts: torch.Tensor | None) -> dict:
+    if counts is None or counts.numel() == 0 or counts.sum().item() <= 0:
+        return {"hard_usage_mean": 0.0, "hard_perplexity_mean": 0.0, "dead_code_fraction_mean": 0.0}
+    probs = counts / counts.sum().clamp_min(1.0)
+    used = counts > 0
+    entropy = -(probs[used] * probs[used].log()).sum()
+    return {
+        "hard_usage_mean": used.float().mean().item(),
+        "hard_perplexity_mean": entropy.exp().item(),
+        "dead_code_fraction_mean": (~used).float().mean().item(),
     }
 
 
@@ -123,6 +180,7 @@ def evaluate_dememte(
     total = 0
     correct = 0
     diag_values = {k: [] for k in VQSA_KEYS}
+    hard_counts = None
     conf_all, corr_all, nll_all, brier_all = [], [], [], []
     prediction_rows = []
 
@@ -143,6 +201,7 @@ def evaluate_dememte(
         one_hot = F.one_hot(y, num_classes=probs.size(1)).float()
         brier = ((probs - one_hot) ** 2).sum(dim=1)
         diagnostics = _vqsa_batch_diagnostics(dbg, y.size(0))
+        hard_counts = _add_global_hard_counts(hard_counts, dbg)
 
         total += y.size(0)
         correct += ok.sum().item()
@@ -181,6 +240,7 @@ def evaluate_dememte(
     }
     for key, values in diag_values.items():
         result.update(_signal_summary(values, key))
+    result.update(_global_hard_summary(hard_counts))
     if return_predictions:
         result["predictions"] = prediction_rows
     return result

@@ -6,6 +6,7 @@ import copy
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 
 from .corruptions import apply_train_corruption
@@ -23,6 +24,38 @@ def set_requires_grad(module: nn.Module, requires_grad: bool) -> None:
 
 def _trainable_params(module: nn.Module):
     return [p for p in module.parameters() if p.requires_grad]
+
+
+def _vqsa_align_mode(config) -> str:
+    return str(getattr(config, "vqsa_align_mode", "none"))
+
+
+def _validate_vqsa_alignment_config(config) -> None:
+    mode = _vqsa_align_mode(config)
+    quantizer_type = str(getattr(config, "quantizer_type", "vq"))
+    if quantizer_type not in {"vq", "ema_vq", "simvq_linear", "fsq"}:
+        raise ValueError("Unknown quantizer_type: {!r}. Choices: ['vq', 'ema_vq', 'simvq_linear', 'fsq']".format(quantizer_type))
+    if mode not in {"none", "zq_mse"}:
+        raise ValueError(f"Unknown VQSA alignment mode: {mode!r}. Choices: ['none', 'zq_mse']")
+    if mode != "none" and not bool(getattr(config, "vqsa_use_codebook", True)):
+        raise ValueError("VQSA alignment requires vqsa_use_codebook=True because it operates on zq.")
+
+
+def _vqsa_alignment_loss(dbg: dict, clean_batch_size: int, train: bool, config) -> torch.Tensor:
+    mode = _vqsa_align_mode(config)
+    zq = dbg["zq"]
+    if mode == "none" or not train:
+        return zq.sum() * 0.0
+    if mode == "zq_mse":
+        expected = clean_batch_size * 2
+        if zq.size(0) != expected:
+            raise ValueError(
+                f"zq_mse alignment expects a clean+corrupt mixed batch of size {expected}, got {zq.size(0)}."
+            )
+        zq_clean = zq[:clean_batch_size].detach()
+        zq_corrupt = zq[clean_batch_size:]
+        return F.mse_loss(zq_corrupt, zq_clean)
+    raise ValueError(f"Unknown VQSA alignment mode: {mode!r}. Choices: ['none', 'zq_mse']")
 
 
 # ---------------------------------------------------------------------------
@@ -51,7 +84,58 @@ def make_optimizer_vqsa(model: DeMemteVQSA, config):
     return optim.AdamW(groups, weight_decay=config.weight_decay)
 
 
-def run_epoch_vqsa(model, loader, optimizer, train, config, device, criterion):
+def _add_hard_usage(counts: torch.Tensor | None, dbg: dict) -> torch.Tensor | None:
+    indices = dbg.get("encoding_indices")
+    num_embeddings = int(dbg.get("num_embeddings", 0) or 0)
+    if indices is None or num_embeddings <= 0:
+        return counts
+    batch_counts = torch.bincount(indices.detach().reshape(-1).long().cpu(), minlength=num_embeddings).float()
+    if counts is None:
+        return batch_counts
+    if counts.numel() < batch_counts.numel():
+        padded = torch.zeros_like(batch_counts)
+        padded[: counts.numel()] = counts
+        counts = padded
+    counts[: batch_counts.numel()] += batch_counts
+    return counts
+
+
+def _hard_usage_metrics(counts: torch.Tensor | None) -> dict:
+    if counts is None or counts.numel() == 0 or counts.sum().item() <= 0:
+        return {"hard_usage": 0.0, "hard_perplexity": 0.0, "dead_code_fraction": 0.0}
+    probs = counts / counts.sum().clamp_min(1.0)
+    used = counts > 0
+    entropy = -(probs[used] * probs[used].log()).sum()
+    return {
+        "hard_usage": used.float().mean().item(),
+        "hard_perplexity": entropy.exp().item(),
+        "dead_code_fraction": (~used).float().mean().item(),
+    }
+
+
+@torch.no_grad()
+def initialize_vqsa_codebook(model, loader, config, device) -> bool:
+    if not bool(getattr(config, "vq_kmeans_init", False)):
+        return False
+    init_fn = getattr(model.vqsa, "initialize_codebook_from_latents", None)
+    if init_fn is None:
+        return False
+    was_training = model.training
+    model.eval()
+    try:
+        x, _ = next(iter(loader))
+    except StopIteration:
+        model.train(was_training)
+        return False
+    x = x.to(device, non_blocking=True)
+    _, z = model.encode_z(x)
+    initialized = init_fn(z, steps=int(getattr(config, "vq_kmeans_steps", 10)))
+    model.train(was_training)
+    return bool(initialized)
+
+
+def run_epoch_vqsa(model, loader, optimizer, train, config, device, criterion, epoch: int | None = None):
+    _validate_vqsa_alignment_config(config)
     configure_vqsa_training(model, config, train=train)
     totals = {
         "loss": 0.0,
@@ -59,9 +143,11 @@ def run_epoch_vqsa(model, loader, optimizer, train, config, device, criterion):
         "vq": 0.0,
         "codebook": 0.0,
         "commitment": 0.0,
+        "align": 0.0,
         "acc": 0.0,
         "n": 0,
     }
+    hard_counts = None
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
@@ -75,11 +161,16 @@ def run_epoch_vqsa(model, loader, optimizer, train, config, device, criterion):
 
         logits, vq_loss, dbg = model(x_in, return_debug=True)
         ce_loss = criterion(logits, y_in)
-        loss = ce_loss + config.vq_weight * vq_loss
+        align_loss = _vqsa_alignment_loss(dbg, x.size(0), train, config)
+        loss = ce_loss + config.vq_weight * vq_loss + getattr(config, "align_weight", 0.0) * align_loss
 
         if train:
             loss.backward()
             optimizer.step()
+            if bool(getattr(config, "dead_code_restart", False)) and epoch is not None:
+                restart_after = int(getattr(config, "dead_code_restart_after_epoch", 1))
+                if epoch > restart_after:
+                    model.vqsa.restart_dead_codes_from_latents(dbg["z"].detach())
 
         bs = y_in.size(0)
         totals["loss"] += loss.item() * bs
@@ -87,11 +178,14 @@ def run_epoch_vqsa(model, loader, optimizer, train, config, device, criterion):
         totals["vq"] += vq_loss.item() * bs
         totals["codebook"] += dbg["codebook_loss"].item() * bs
         totals["commitment"] += dbg["commitment_loss"].item() * bs
+        totals["align"] += align_loss.item() * bs
         totals["acc"] += (logits.argmax(1) == y_in).float().mean().item() * bs
         totals["n"] += bs
+        hard_counts = _add_hard_usage(hard_counts, dbg)
 
-    for k in ("loss", "ce", "vq", "codebook", "commitment", "acc"):
+    for k in ("loss", "ce", "vq", "codebook", "commitment", "align", "acc"):
         totals[k] /= max(1, totals["n"])
+    totals.update(_hard_usage_metrics(hard_counts))
     return totals
 
 
@@ -99,6 +193,7 @@ def train_dememte_vqsa(model, train_loader, val_loader, config, device, criterio
     """Single strict VQSA schedule: clean+corrupt mixed batches, early stop on clean val accuracy."""
     criterion = criterion or nn.CrossEntropyLoss()
     configure_vqsa_training(model, config, train=True)
+    initialize_vqsa_codebook(model, train_loader, config, device)
     opt = make_optimizer_vqsa(model, config)
     sch = optim.lr_scheduler.ReduceLROnPlateau(
         opt,
@@ -108,14 +203,16 @@ def train_dememte_vqsa(model, train_loader, val_loader, config, device, criterio
     )
     best_acc, best_state, no_imp = -1.0, copy.deepcopy(model.state_dict()), 0
     for ep in range(1, config.epochs_vqsa_max + 1):
-        tr = run_epoch_vqsa(model, train_loader, opt, True, config, device, criterion)
-        va = run_epoch_vqsa(model, val_loader, opt, False, config, device, criterion)
+        tr = run_epoch_vqsa(model, train_loader, opt, True, config, device, criterion, epoch=ep)
+        va = run_epoch_vqsa(model, val_loader, opt, False, config, device, criterion, epoch=ep)
         sch.step(va["acc"])
         if verbose:
             print(
                 f"[VQSA {ep:02d}] "
                 f"tr_loss={tr['loss']:.4f} tr_acc={tr['acc']:.4f} "
-                f"val_loss={va['loss']:.4f} val_acc={va['acc']:.4f} val_vq={va['vq']:.4f}"
+                f"val_loss={va['loss']:.4f} val_acc={va['acc']:.4f} "
+                f"val_vq={va['vq']:.4f} tr_align={tr['align']:.4f} "
+                f"val_usage={va['hard_usage']:.4f} val_hard_ppl={va['hard_perplexity']:.2f}"
             )
         if va["acc"] > best_acc + config.early_stop_min_delta:
             best_acc, best_state, no_imp = va["acc"], copy.deepcopy(model.state_dict()), 0

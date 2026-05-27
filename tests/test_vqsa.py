@@ -1,11 +1,12 @@
+import pytest
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
-from dememte.config import E5Config
+from dememte.config import E5Config, e6_config
 from dememte.evaluation import evaluate_dememte_suite
 from dememte.io import load_checkpoint, save_checkpoint
-from dememte.models import DeMemteVQSA, VectorQuantizer2D
+from dememte.models import DeMemteVQSA, EMAVectorQuantizer2D, FSQQuantizer2D, SimVQLinearQuantizer2D, VectorQuantizer2D
 from dememte.training import make_optimizer_vqsa, run_epoch_vqsa
 
 
@@ -51,6 +52,11 @@ def make_tiny_model(cfg=None):
         vqsa_fusion_mode=cfg.vqsa_fusion_mode,
         vqsa_use_codebook=cfg.vqsa_use_codebook,
         vqsa_use_self_attention=cfg.vqsa_use_self_attention,
+        quantizer_type=getattr(cfg, "quantizer_type", "vq"),
+        vq_ema_decay=getattr(cfg, "vq_ema_decay", 0.99),
+        dead_code_threshold=getattr(cfg, "dead_code_threshold", 1.0),
+        dead_code_restart_jitter=getattr(cfg, "dead_code_restart_jitter", 0.01),
+        fsq_levels=getattr(cfg, "fsq_levels", 8),
     )
 
 
@@ -68,6 +74,71 @@ def test_vector_quantizer_outputs_and_soft_assign():
         assert torch.isfinite(loss)
 
 
+def test_vector_quantizer_can_return_hard_indices():
+    quantizer = VectorQuantizer2D(num_embeddings=32, embedding_dim=16, return_indices=True)
+    z = torch.randn(2, 16, 7, 7)
+    *_, indices = quantizer(z)
+
+    assert indices.shape == (2, 7, 7)
+    assert indices.min() >= 0
+    assert indices.max() < 32
+
+
+def test_ema_quantizer_kmeans_update_and_dead_restart():
+    quantizer = EMAVectorQuantizer2D(
+        num_embeddings=8,
+        embedding_dim=4,
+        decay=0.5,
+        dead_code_threshold=0.5,
+        return_indices=True,
+    )
+    z = torch.randn(2, 4, 3, 3)
+    quantizer.initialize_from_data(z, steps=2)
+    assert quantizer.usage_ema.sum().item() == pytest.approx(8.0)
+
+    quantizer.train()
+    zq, vq_loss, *_rest, indices = quantizer(z)
+
+    assert zq.shape == z.shape
+    assert torch.isfinite(vq_loss)
+    assert indices.shape == (2, 3, 3)
+    assert quantizer.usage_ema.sum().item() > 8.0
+
+    quantizer.usage_ema.zero_()
+    flat = z.permute(0, 2, 3, 1).reshape(-1, 4)
+    quantizer.restart_dead_codes(flat)
+    assert torch.all(quantizer.usage_ema >= 0.5)
+
+
+def test_simvq_linear_backward_reaches_global_transform():
+    quantizer = SimVQLinearQuantizer2D(num_embeddings=8, embedding_dim=4, return_indices=True)
+    z = torch.randn(2, 4, 3, 3, requires_grad=True)
+    zq, vq_loss, *_ = quantizer(z)
+    loss = zq.mean() + vq_loss
+    loss.backward()
+
+    assert z.grad is not None
+    assert quantizer.codebook_transform.weight.grad is not None
+
+
+def test_fsq_quantizer_forward_backward_and_scalar_indices():
+    quantizer = FSQQuantizer2D(num_embeddings=32, embedding_dim=4, levels=6, return_indices=True)
+    z = torch.randn(2, 4, 3, 3, requires_grad=True)
+    zq, vq_loss, codebook_loss, commitment_loss, dq_map, soft_assign, indices = quantizer(z)
+    loss = zq.mean() + vq_loss
+    loss.backward()
+
+    assert zq.shape == z.shape
+    assert dq_map.shape == (2, 1, 3, 3)
+    assert soft_assign is None
+    assert indices.shape == (2, 3, 3, 4)
+    assert indices.min() >= 0
+    assert indices.max() < 6
+    assert codebook_loss.item() == 0.0
+    assert torch.isfinite(commitment_loss)
+    assert z.grad is not None
+
+
 def test_dememte_vqsa_forward_debug_and_backward():
     cfg = tiny_config()
     model = make_tiny_model(cfg)
@@ -81,6 +152,7 @@ def test_dememte_vqsa_forward_debug_and_backward():
     assert logits.shape == (2, cfg.num_classes)
     assert dbg["z"].shape == (2, cfg.latent_dim, 7, 7)
     assert dbg["zq"].shape == dbg["z"].shape
+    assert dbg["encoding_indices"].shape == (2, 7, 7)
     assert dbg["attention_weights"].shape[:3] == (2, cfg.vqsa_layers, cfg.vqsa_heads)
     assert model.projector.net[0].weight.grad is not None
     assert model.vq.embedding.weight.grad is not None
@@ -98,12 +170,100 @@ def test_vqsa_training_smoke_and_checkpoint(tmp_path):
 
     totals = run_epoch_vqsa(model, loader, optimizer, True, cfg, "cpu", nn.CrossEntropyLoss())
     assert torch.isfinite(torch.tensor(totals["loss"]))
+    assert "align" in totals
+    assert "hard_usage" in totals
+    assert "hard_perplexity" in totals
+    assert "dead_code_fraction" in totals
+    assert totals["align"] == 0.0
 
     ckpt = tmp_path / "vqsa.pt"
     save_checkpoint(model, ckpt, extra={"best_val": totals["acc"]})
     reloaded = make_tiny_model(cfg)
     payload = load_checkpoint(reloaded, ckpt, device="cpu", strict=True)
     assert "best_val" in payload
+
+
+def test_e6_configs_select_paper_faithful_and_zq_alignment():
+    paper = e6_config("e6_paper_faithful")
+    aligned = e6_config("e6_zq_align_mse")
+    ema = e6_config("e6_ema_kmeans_restart")
+    winner = e6_config("e6_winner")
+    simvq = e6_config("e6_simvq_linear")
+    fsq = e6_config("e6_fsq")
+
+    assert paper.variant_name == "e6_paper_faithful"
+    assert paper.vqsa_align_mode == "none"
+    assert paper.align_weight == 0.0
+    assert paper.quantizer_type == "vq"
+
+    assert aligned.variant_name == "e6_zq_align_mse"
+    assert aligned.vqsa_align_mode == "zq_mse"
+    assert aligned.align_weight == 0.1
+    assert aligned.quantizer_type == "vq"
+
+    assert ema.quantizer_type == "ema_vq"
+    assert ema.vq_kmeans_init is True
+    assert ema.dead_code_restart is True
+
+    assert winner.variant_name == "e6_winner"
+    assert winner.quantizer_type == ema.quantizer_type
+    assert winner.vq_kmeans_init == ema.vq_kmeans_init
+    assert winner.dead_code_restart == ema.dead_code_restart
+    assert winner.vqsa_align_mode == ema.vqsa_align_mode
+
+    assert simvq.quantizer_type == "simvq_linear"
+
+    assert fsq.quantizer_type == "fsq"
+    assert fsq.fsq_levels == 8
+
+
+def test_vqsa_zq_alignment_training_smoke():
+    cfg = tiny_config(vqsa_align_mode="zq_mse", align_weight=0.1)
+    model = make_tiny_model(cfg)
+    x = torch.randn(4, 3, 7, 7)
+    y = torch.tensor([0, 1, 2, 1])
+    loader = DataLoader(TensorDataset(x, y), batch_size=2)
+    optimizer = make_optimizer_vqsa(model, cfg)
+
+    totals = run_epoch_vqsa(model, loader, optimizer, True, cfg, "cpu", nn.CrossEntropyLoss())
+
+    assert torch.isfinite(torch.tensor(totals["loss"]))
+    assert torch.isfinite(torch.tensor(totals["align"]))
+    assert totals["align"] >= 0.0
+
+
+def test_vqsa_training_smoke_with_new_quantizer_variants():
+    for quantizer_type in ("ema_vq", "simvq_linear", "fsq"):
+        cfg = tiny_config(
+            quantizer_type=quantizer_type,
+            vq_kmeans_init=(quantizer_type == "ema_vq"),
+            dead_code_restart=(quantizer_type == "ema_vq"),
+            dead_code_restart_after_epoch=0,
+            fsq_levels=6,
+        )
+        model = make_tiny_model(cfg)
+        x = torch.randn(4, 3, 7, 7)
+        y = torch.tensor([0, 1, 2, 1])
+        loader = DataLoader(TensorDataset(x, y), batch_size=2)
+        optimizer = make_optimizer_vqsa(model, cfg)
+
+        totals = run_epoch_vqsa(model, loader, optimizer, True, cfg, "cpu", nn.CrossEntropyLoss(), epoch=1)
+
+        assert torch.isfinite(torch.tensor(totals["loss"]))
+        assert 0.0 <= totals["hard_usage"] <= 1.0
+        assert totals["hard_perplexity"] >= 0.0
+
+
+def test_vqsa_zq_alignment_requires_codebook():
+    cfg = tiny_config(vqsa_use_codebook=False, vqsa_align_mode="zq_mse", align_weight=0.1)
+    model = make_tiny_model(cfg)
+    x = torch.randn(2, 3, 7, 7)
+    y = torch.tensor([0, 1])
+    loader = DataLoader(TensorDataset(x, y), batch_size=2)
+    optimizer = make_optimizer_vqsa(model, cfg)
+
+    with pytest.raises(ValueError, match="requires vqsa_use_codebook=True"):
+        run_epoch_vqsa(model, loader, optimizer, True, cfg, "cpu", nn.CrossEntropyLoss())
 
 
 def test_evaluate_dememte_suite_has_vqsa_metrics_without_gate_keys():
@@ -120,4 +280,7 @@ def test_evaluate_dememte_suite_has_vqsa_metrics_without_gate_keys():
     assert "corrupt_acc_avg" in metrics
     assert "vq_loss_clean" in metrics
     assert "attention_entropy_clean" in metrics
+    assert "hard_usage_clean" in metrics
+    assert "hard_perplexity_clean" in metrics
+    assert "dead_code_fraction_clean" in metrics
     assert all("gate" not in key for key in metrics)

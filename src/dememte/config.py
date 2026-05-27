@@ -71,6 +71,15 @@ class E5Config:
     commitment_cost: float = 0.25
     vq_temperature: float = 1.0
     vq_weight: float = 1.0
+    quantizer_type: str = "vq"
+    vq_ema_decay: float = 0.99
+    vq_kmeans_init: bool = False
+    vq_kmeans_steps: int = 10
+    dead_code_restart: bool = False
+    dead_code_restart_after_epoch: int = 1
+    dead_code_threshold: float = 1.0
+    dead_code_restart_jitter: float = 0.01
+    fsq_levels: int = 8
     vqsa_heads: int = 4
     vqsa_layers: int = 2
     vqsa_dropout: float = 0.1
@@ -78,10 +87,20 @@ class E5Config:
     vqsa_use_codebook: bool = True
     vqsa_use_self_attention: bool = True
     vqsa_train_backbone: bool = False
+    vqsa_align_mode: str = "none"
+    align_weight: float = 0.0
     train_corrupt_prob: float = 0.7
 
     out_dir: str = "./out"
     seed: int = 42
+
+
+@dataclass
+class E6Config(E5Config):
+    """E6 VQSA experiment configuration with optional clean/corrupt zq alignment."""
+
+    variant_name: str = "e6_paper_faithful"
+    variant_label: str = "E6 paper-faithful VQSA"
 
 
 @dataclass
@@ -118,6 +137,63 @@ ABLATION_SPECS = {
 }
 
 
+E6_SPECS = {
+    "e6_paper_faithful": {
+        "label": "E6 paper-faithful VQSA",
+        "overrides": {"vqsa_align_mode": "none", "align_weight": 0.0},
+    },
+    "e6_zq_align_mse": {
+        "label": "E6 zq MSE alignment",
+        "overrides": {"vqsa_align_mode": "zq_mse", "align_weight": 0.1},
+    },
+    "e6_ema_kmeans_restart": {
+        "label": "E6 EMA VQ + k-means init + dead-code restart",
+        "overrides": {
+            "quantizer_type": "ema_vq",
+            "vq_kmeans_init": True,
+            "vq_kmeans_steps": 10,
+            "dead_code_restart": True,
+            "dead_code_restart_after_epoch": 1,
+            "dead_code_threshold": 1.0,
+            "dead_code_restart_jitter": 0.01,
+            "vqsa_align_mode": "none",
+            "align_weight": 0.0,
+        },
+    },
+    "e6_winner": {
+        "label": "E6 winner: EMA VQ + k-means init + dead-code restart",
+        "overrides": {
+            "quantizer_type": "ema_vq",
+            "vq_kmeans_init": True,
+            "vq_kmeans_steps": 10,
+            "dead_code_restart": True,
+            "dead_code_restart_after_epoch": 1,
+            "dead_code_threshold": 1.0,
+            "dead_code_restart_jitter": 0.01,
+            "vqsa_align_mode": "none",
+            "align_weight": 0.0,
+        },
+    },
+    "e6_simvq_linear": {
+        "label": "E6 SimVQ linear codebook",
+        "overrides": {
+            "quantizer_type": "simvq_linear",
+            "vqsa_align_mode": "none",
+            "align_weight": 0.0,
+        },
+    },
+    "e6_fsq": {
+        "label": "E6 finite scalar quantization",
+        "overrides": {
+            "quantizer_type": "fsq",
+            "fsq_levels": 8,
+            "vqsa_align_mode": "none",
+            "align_weight": 0.0,
+        },
+    },
+}
+
+
 def ablation_config(variant_name: str, base: Optional[E5Config] = None) -> AblationConfig:
     """Return an AblationConfig pre-configured for a given variant name."""
     if variant_name not in ABLATION_SPECS:
@@ -129,6 +205,19 @@ def ablation_config(variant_name: str, base: Optional[E5Config] = None) -> Ablat
     for k, v in spec["overrides"].items():
         base_dict[k] = v
     return AblationConfig(**base_dict)
+
+
+def e6_config(variant_name: str, base: Optional[E5Config] = None) -> E6Config:
+    """Return an E6Config pre-configured for a paper-faithful or aligned E6 variant."""
+    if variant_name not in E6_SPECS:
+        raise KeyError(f"Unknown E6 variant: {variant_name!r}. Choices: {list(E6_SPECS)}")
+    spec = E6_SPECS[variant_name]
+    base_dict = asdict(base if base is not None else E6Config())
+    base_dict["variant_name"] = variant_name
+    base_dict["variant_label"] = spec["label"]
+    for k, v in spec["overrides"].items():
+        base_dict[k] = v
+    return E6Config(**base_dict)
 
 
 def resolve_data_dir(config) -> str:

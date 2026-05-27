@@ -52,12 +52,22 @@ The default `E5Config` uses:
 
 - `latent_dim = 256`
 - `num_embeddings = 1024`
+- `quantizer_type = "vq"`
 - `vqsa_heads = 4`
 - `vqsa_layers = 2`
 - `vqsa_dropout = 0.1`
 - `commitment_cost = 0.25`
 - `vq_weight = 1.0`
 - `train_corrupt_prob = 0.7`
+
+E6 adds anti-collapse quantizer variants:
+
+- `e6_paper_faithful` — original gradient-updated VQ control.
+- `e6_zq_align_mse` — original VQ plus clean/corrupt `zq` alignment.
+- `e6_ema_kmeans_restart` — EMA codebook updates, k-means initialization, and dead-code restarts.
+- `e6_winner` — stable alias for the best VQ codebook variant, currently EMA + k-means + dead-code restarts.
+- `e6_simvq_linear` — SimVQ-style codebook from a learned global linear transform.
+- `e6_fsq` — finite scalar quantization without a learned lookup table.
 
 ## Ablations
 
@@ -86,6 +96,9 @@ It also reports VQSA diagnostics:
 - `dq_mean`
 - `assignment_entropy`
 - `codebook_perplexity`
+- `hard_usage`
+- `hard_perplexity`
+- `dead_code_fraction`
 - `attention_entropy`
 
 Gate-specific metrics such as `gate_mean`, `gate_raw`, `pareidolia_rate`, and prediction-change metrics are intentionally removed.

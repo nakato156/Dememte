@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from .baseline import make_backbone
-from .vq import LatentProjector, VectorQuantizer2D
+from .vq import LatentProjector, VectorQuantizer2D, make_quantizer2d
 
 
 class SelfAttentionBlock(nn.Module):
@@ -62,6 +62,11 @@ class VQSAFusion(nn.Module):
         fusion_mode: str = "concat",
         use_codebook: bool = True,
         use_self_attention: bool = True,
+        quantizer_type: str = "vq",
+        ema_decay: float = 0.99,
+        dead_code_threshold: float = 1.0,
+        restart_jitter: float = 0.01,
+        fsq_levels: int = 8,
     ):
         super().__init__()
         if fusion_mode not in self.VALID_FUSIONS:
@@ -70,8 +75,20 @@ class VQSAFusion(nn.Module):
         self.fusion_mode = fusion_mode
         self.use_codebook = bool(use_codebook)
         self.use_self_attention = bool(use_self_attention)
+        self.quantizer_type = quantizer_type
         self.projector = LatentProjector(in_channels, latent_dim)
-        self.vq = VectorQuantizer2D(num_embeddings, latent_dim, commitment_cost, vq_temperature)
+        self.vq = make_quantizer2d(
+            quantizer_type,
+            num_embeddings,
+            latent_dim,
+            commitment_cost,
+            vq_temperature,
+            ema_decay=ema_decay,
+            dead_code_threshold=dead_code_threshold,
+            restart_jitter=restart_jitter,
+            fsq_levels=fsq_levels,
+            return_indices=True,
+        )
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.attention = nn.ModuleList([
             SelfAttentionBlock(latent_dim, num_heads=num_heads, dropout=dropout)
@@ -92,12 +109,13 @@ class VQSAFusion(nn.Module):
     def forward(self, feats: torch.Tensor):
         z = self.projector(feats)
         if self.use_codebook:
-            zq, vq_loss, codebook_loss, commitment_loss, dq_map, soft_assign = self.vq(z)
+            zq, vq_loss, codebook_loss, commitment_loss, dq_map, soft_assign, encoding_indices = self.vq(z)
         else:
             zq = z
             vq_loss = codebook_loss = commitment_loss = self._zero_loss(z)
             dq_map = torch.zeros(z.size(0), 1, z.size(2), z.size(3), device=z.device, dtype=z.dtype)
             soft_assign = None
+            encoding_indices = None
 
         z_pool = self.pool(z).flatten(1)
         zq_pool = self.pool(zq).flatten(1)
@@ -121,8 +139,28 @@ class VQSAFusion(nn.Module):
             "commitment_loss": commitment_loss,
             "dq_map": dq_map,
             "soft_assign": soft_assign,
+            "encoding_indices": encoding_indices,
+            "quantizer_type": self.quantizer_type,
+            "num_embeddings": int(getattr(self.vq, "num_embeddings", 0)),
         }
         return fused, debug
+
+    @torch.no_grad()
+    def initialize_codebook_from_latents(self, z: torch.Tensor, steps: int = 10) -> bool:
+        init_fn = getattr(self.vq, "initialize_from_data", None)
+        if init_fn is None:
+            return False
+        init_fn(z, steps=steps)
+        return True
+
+    @torch.no_grad()
+    def restart_dead_codes_from_latents(self, z: torch.Tensor) -> bool:
+        restart_fn = getattr(self.vq, "restart_dead_codes", None)
+        if restart_fn is None:
+            return False
+        flat = z.detach().permute(0, 2, 3, 1).reshape(-1, z.size(1))
+        restart_fn(flat)
+        return True
 
 
 class DeMemteVQSA(nn.Module):
@@ -142,6 +180,11 @@ class DeMemteVQSA(nn.Module):
         vqsa_fusion_mode: str = "concat",
         vqsa_use_codebook: bool = True,
         vqsa_use_self_attention: bool = True,
+        quantizer_type: str = "vq",
+        vq_ema_decay: float = 0.99,
+        dead_code_threshold: float = 1.0,
+        dead_code_restart_jitter: float = 0.01,
+        fsq_levels: int = 8,
     ):
         super().__init__()
         self.backbone = backbone
@@ -157,6 +200,11 @@ class DeMemteVQSA(nn.Module):
             fusion_mode=vqsa_fusion_mode,
             use_codebook=vqsa_use_codebook,
             use_self_attention=vqsa_use_self_attention,
+            quantizer_type=quantizer_type,
+            ema_decay=vq_ema_decay,
+            dead_code_threshold=dead_code_threshold,
+            restart_jitter=dead_code_restart_jitter,
+            fsq_levels=fsq_levels,
         )
         self.classifier = nn.Sequential(
             nn.Linear(2 * latent_dim, 512),
@@ -207,6 +255,11 @@ def make_dememte_variant(config, device: str = "cuda") -> DeMemteVQSA:
         vqsa_fusion_mode=config.vqsa_fusion_mode,
         vqsa_use_codebook=config.vqsa_use_codebook,
         vqsa_use_self_attention=config.vqsa_use_self_attention,
+        quantizer_type=getattr(config, "quantizer_type", "vq"),
+        vq_ema_decay=getattr(config, "vq_ema_decay", 0.99),
+        dead_code_threshold=getattr(config, "dead_code_threshold", 1.0),
+        dead_code_restart_jitter=getattr(config, "dead_code_restart_jitter", 0.01),
+        fsq_levels=getattr(config, "fsq_levels", 8),
     ).to(device)
     model.set_backbone_trainable(bool(getattr(config, "vqsa_train_backbone", False)))
     return model
@@ -216,6 +269,12 @@ def make_dememte_e5(config=None, device: str = "cuda") -> DeMemteVQSA:
     """Convenience: build the strict VQSA default config if none is provided."""
     from ..config import E5Config
     return make_dememte_variant(config or E5Config(), device=device)
+
+
+def make_dememte_e6(config=None, device: str = "cuda") -> DeMemteVQSA:
+    """Convenience: build an E6 VQSA config with optional zq alignment."""
+    from ..config import E6Config
+    return make_dememte_variant(config or E6Config(), device=device)
 
 
 def attention_entropy(attention_weights: torch.Tensor | None) -> torch.Tensor:
