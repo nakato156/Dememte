@@ -276,6 +276,174 @@ def evaluate_dememte_suite(model, loader, device="cuda", return_predictions=Fals
     return metrics
 
 
+def _tta_stats_dict(adapter) -> dict:
+    stats = getattr(adapter, "stats", None)
+    if stats is None:
+        return {
+            "tta_updates": 0,
+            "tta_reliable": 0,
+            "tta_selected": 0,
+            "tta_seen": 0,
+            "tta_selection_rate": 0.0,
+        }
+    seen = int(getattr(stats, "seen", 0))
+    selected = int(getattr(stats, "selected", 0))
+    return {
+        "tta_updates": int(getattr(stats, "updates", 0)),
+        "tta_reliable": int(getattr(stats, "reliable", 0)),
+        "tta_selected": selected,
+        "tta_seen": seen,
+        "tta_selection_rate": float(selected / max(1, seen)),
+    }
+
+
+def evaluate_dememte_tta(
+    adapter,
+    loader,
+    device: str = "cuda",
+    corruption: Optional[str] = None,
+    severity: float = 0.0,
+    base_seed: int = 1234,
+    return_predictions: bool = False,
+    tta_method: str = "tta",
+    tta_base_variant: str = "unknown",
+):
+    total = 0
+    correct = 0
+    diag_values = {k: [] for k in VQSA_KEYS}
+    hard_counts = None
+    conf_all, corr_all, nll_all, brier_all = [], [], [], []
+    prediction_rows = []
+
+    g = torch.Generator(device=device)
+    corr_offset = 0 if corruption is None else sum(ord(c) for c in corruption)
+    g.manual_seed(base_seed + int(1000 * severity) + corr_offset)
+
+    sample_offset = 0
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        x_eval = apply_eval_corruption(x, corruption, severity, g)
+        logits, dbg = adapter(x_eval, return_debug=True)
+        probs = torch.softmax(logits.detach(), dim=1)
+        conf, pred = probs.max(1)
+        ok = pred == y
+        y_prob = probs.gather(1, y.view(-1, 1)).squeeze(1).clamp_min(1e-12)
+        one_hot = F.one_hot(y, num_classes=probs.size(1)).float()
+        brier = ((probs - one_hot) ** 2).sum(dim=1)
+        diagnostics = _vqsa_batch_diagnostics(dbg, y.size(0))
+        hard_counts = _add_global_hard_counts(hard_counts, dbg)
+
+        total += y.size(0)
+        correct += ok.sum().item()
+        conf_all.extend(conf.detach().cpu().tolist())
+        corr_all.extend(ok.detach().cpu().tolist())
+        nll_all.extend((-torch.log(y_prob)).detach().cpu().tolist())
+        brier_all.extend(brier.detach().cpu().tolist())
+        for key in VQSA_KEYS:
+            diag_values[key].append(diagnostics[key].detach().cpu())
+
+        if return_predictions:
+            for j in range(y.size(0)):
+                row = {
+                    "sample_id": sample_offset + j,
+                    "corruption": "clean" if corruption is None else corruption,
+                    "severity": float(severity),
+                    "target": int(y[j].item()),
+                    "pred": int(pred[j].item()),
+                    "correct": bool(ok[j].item()),
+                    "confidence": float(conf[j].item()),
+                    "nll": float(-torch.log(y_prob[j]).item()),
+                    "brier": float(brier[j].item()),
+                    "tta_method": tta_method,
+                    "tta_base_variant": tta_base_variant,
+                }
+                for key in VQSA_KEYS:
+                    row[key] = float(diagnostics[key][j].item())
+                prediction_rows.append(row)
+            sample_offset += y.size(0)
+
+    rc_conf = _risk_coverage_auc(conf_all, corr_all)
+    result = {
+        "acc": correct / max(1, total),
+        "ece": _compute_ece(conf_all, corr_all),
+        "nll": float(np.mean(nll_all)) if nll_all else 0.0,
+        "brier": float(np.mean(brier_all)) if brier_all else 0.0,
+        "aurc_confidence": rc_conf["aurc"],
+        "tta_method": tta_method,
+        "tta_base_variant": tta_base_variant,
+    }
+    result.update(_tta_stats_dict(adapter))
+    for key, values in diag_values.items():
+        result.update(_signal_summary(values, key))
+    result.update(_global_hard_summary(hard_counts))
+    if return_predictions:
+        result["predictions"] = prediction_rows
+    return result
+
+
+def evaluate_dememte_tta_suite(
+    adapter_factory,
+    loader,
+    device="cuda",
+    return_predictions=False,
+    suite=None,
+    tta_method="tta",
+    tta_base_variant="unknown",
+):
+    suite = suite or STRICT_SUITE
+    clean = evaluate_dememte_tta(
+        adapter_factory(),
+        loader,
+        device=device,
+        corruption=None,
+        severity=0.0,
+        return_predictions=return_predictions,
+        tta_method=tta_method,
+        tta_base_variant=tta_base_variant,
+    )
+    corrupt_records = {}
+    for corr, levels in suite.items():
+        corrupt_records[corr] = [
+            evaluate_dememte_tta(
+                adapter_factory(),
+                loader,
+                device=device,
+                corruption=corr,
+                severity=l,
+                return_predictions=return_predictions,
+                tta_method=tta_method,
+                tta_base_variant=tta_base_variant,
+            )
+            for l in levels
+        ]
+    acc_by_corr = {f"corrupt_acc_{c}": float(np.mean([r["acc"] for r in rows])) for c, rows in corrupt_records.items()}
+    all_corrupt = [r for rows in corrupt_records.values() for r in rows]
+    metrics = {
+        "clean_acc": clean["acc"],
+        "corrupt_acc_avg": float(np.mean(list(acc_by_corr.values()))),
+        **acc_by_corr,
+        "ece_clean": clean["ece"],
+        "ece_corrupt_avg": float(np.mean([r["ece"] for r in all_corrupt])),
+        "nll_clean": clean["nll"],
+        "nll_corrupt_avg": float(np.mean([r["nll"] for r in all_corrupt])),
+        "brier_clean": clean["brier"],
+        "brier_corrupt_avg": float(np.mean([r["brier"] for r in all_corrupt])),
+        "tta_updates_clean": clean["tta_updates"],
+        "tta_updates_corrupt_avg": float(np.mean([r["tta_updates"] for r in all_corrupt])),
+        "tta_selection_rate_clean": clean["tta_selection_rate"],
+        "tta_selection_rate_corrupt_avg": float(np.mean([r["tta_selection_rate"] for r in all_corrupt])),
+        "tta_method": tta_method,
+        "tta_base_variant": tta_base_variant,
+        "corruption_records": corrupt_records,
+        "clean_record": clean,
+    }
+    for key in VQSA_KEYS:
+        metrics[f"{key}_clean"] = clean[f"{key}_mean"]
+        metrics[f"{key}_corrupt_avg"] = float(np.mean([r[f"{key}_mean"] for r in all_corrupt]))
+    return metrics
+
+
 def signal_curve_rows(variant_name, label, clean_record, corruption_records, suite=None):
     suite = suite or STRICT_SUITE
     rows = []

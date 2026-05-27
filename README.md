@@ -69,6 +69,14 @@ E6 adds anti-collapse quantizer variants:
 - `e6_simvq_linear` — SimVQ-style codebook from a learned global linear transform.
 - `e6_fsq` — finite scalar quantization without a learned lookup table.
 
+E7 adds online test-time adaptation over the E6 winner checkpoint:
+
+- `source` — reloads `e6_ema_kmeans_restart` without adaptation.
+- `tent_bn` — TENT-style entropy minimization over BatchNorm affine parameters only.
+- `eata_lite_d005` / `eata_lite_d04` — EATA-style reliable and non-redundant sample filtering without Fisher regularization.
+
+The TTA implementation keeps dropout and the EMA VQ codebook in eval mode, so adaptation only changes BN scale/shift parameters. SAR was reviewed as part of the E7 design, but is intentionally not implemented in v1 because its SAM two-step optimizer and recovery policy add extra compute and stability decisions beyond the first TTA comparison.
+
 ## Ablations
 
 The ablation registry now follows the paper's module breakdown:

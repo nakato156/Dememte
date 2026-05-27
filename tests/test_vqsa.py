@@ -4,9 +4,16 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
 from dememte.config import E5Config, e6_config
-from dememte.evaluation import evaluate_dememte_suite
+from dememte.evaluation import evaluate_dememte_suite, evaluate_dememte_tta_suite
 from dememte.io import load_checkpoint, save_checkpoint
 from dememte.models import DeMemteVQSA, EMAVectorQuantizer2D, FSQQuantizer2D, SimVQLinearQuantizer2D, VectorQuantizer2D
+from dememte.tta import (
+    EATALiteAdapter,
+    TentAdapter,
+    collect_tta_bn_params,
+    configure_tta_model,
+    make_tta_optimizer,
+)
 from dememte.training import make_optimizer_vqsa, run_epoch_vqsa
 
 
@@ -284,3 +291,103 @@ def test_evaluate_dememte_suite_has_vqsa_metrics_without_gate_keys():
     assert "hard_perplexity_clean" in metrics
     assert "dead_code_fraction_clean" in metrics
     assert all("gate" not in key for key in metrics)
+
+
+def test_tta_collects_only_batchnorm_affine_params():
+    cfg = tiny_config(quantizer_type="ema_vq")
+    model = make_tiny_model(cfg)
+    params, names = collect_tta_bn_params(model)
+
+    assert params
+    assert all(name.endswith((".weight", ".bias")) for name in names)
+    assert all("projector.net.1" in name for name in names)
+    assert all("classifier" not in name for name in names)
+    assert all("attention" not in name for name in names)
+    assert all("vq.embedding" not in name for name in names)
+
+
+def test_configure_tta_model_keeps_vq_and_dropout_eval_but_bn_adaptable():
+    cfg = tiny_config(quantizer_type="ema_vq", vqsa_dropout=0.2)
+    model = make_tiny_model(cfg)
+    configured = configure_tta_model(model)
+    params, _ = collect_tta_bn_params(configured)
+
+    assert configured.training is False
+    assert configured.vq.training is False
+    assert all(isinstance(m, nn.Dropout) and not m.training for m in configured.modules() if isinstance(m, nn.Dropout))
+    assert all(p.requires_grad for p in params)
+    assert any(not p.requires_grad for name, p in configured.named_parameters() if "classifier" in name)
+    for module in configured.modules():
+        if isinstance(module, nn.BatchNorm2d):
+            assert module.track_running_stats is False
+            assert module.running_mean is None
+            assert module.running_var is None
+
+
+def test_tent_step_updates_bn_without_changing_ema_quantizer_state():
+    cfg = tiny_config(quantizer_type="ema_vq", vqsa_dropout=0.0)
+    model = configure_tta_model(make_tiny_model(cfg))
+    params, _ = collect_tta_bn_params(model)
+    optimizer = make_tta_optimizer(params, lr=1e-2, momentum=0.0)
+    adapter = TentAdapter(model, optimizer)
+    x = torch.randn(4, 3, 7, 7)
+    bn_before = [p.detach().clone() for p in params]
+    vq_before = {k: v.detach().clone() for k, v in model.vq.state_dict().items()}
+
+    logits, dbg = adapter(x, return_debug=True)
+
+    assert logits.shape == (4, cfg.num_classes)
+    assert "zq" in dbg
+    assert adapter.stats.updates == 1
+    assert any(not torch.allclose(before, after.detach()) for before, after in zip(bn_before, params))
+    for key, before in vq_before.items():
+        assert torch.allclose(before, model.vq.state_dict()[key])
+
+
+def test_eata_lite_with_impossible_margin_skips_update():
+    cfg = tiny_config()
+    model = configure_tta_model(make_tiny_model(cfg))
+    params, _ = collect_tta_bn_params(model)
+    optimizer = make_tta_optimizer(params, lr=1e-2, momentum=0.0)
+    adapter = EATALiteAdapter(model, optimizer, num_classes=cfg.num_classes, e_margin=-1.0)
+    x = torch.randn(4, 3, 7, 7)
+    bn_before = [p.detach().clone() for p in params]
+
+    adapter(x)
+
+    assert adapter.stats.updates == 0
+    assert adapter.stats.reliable == 0
+    assert adapter.stats.selected == 0
+    assert adapter.stats.seen == 4
+    assert all(torch.allclose(before, after.detach()) for before, after in zip(bn_before, params))
+
+
+def test_evaluate_dememte_tta_suite_reports_standard_and_tta_metrics():
+    cfg = tiny_config(vqsa_layers=0, vqsa_use_self_attention=False)
+    x = torch.randn(4, 3, 7, 7)
+    y = torch.tensor([0, 1, 2, 1])
+    loader = DataLoader(TensorDataset(x, y), batch_size=2)
+    suite = {"gaussian_noise": [0.1]}
+
+    def factory():
+        model = configure_tta_model(make_tiny_model(cfg))
+        params, _ = collect_tta_bn_params(model)
+        optimizer = make_tta_optimizer(params, lr=1e-3, momentum=0.0)
+        return TentAdapter(model, optimizer)
+
+    metrics = evaluate_dememte_tta_suite(
+        factory,
+        loader,
+        device="cpu",
+        suite=suite,
+        tta_method="tent_bn",
+        tta_base_variant="tiny",
+    )
+
+    assert "clean_acc" in metrics
+    assert "corrupt_acc_avg" in metrics
+    assert "vq_loss_clean" in metrics
+    assert "tta_updates_clean" in metrics
+    assert "tta_selection_rate_corrupt_avg" in metrics
+    assert metrics["tta_method"] == "tent_bn"
+    assert metrics["tta_base_variant"] == "tiny"
