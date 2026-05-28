@@ -9,9 +9,15 @@ from dememte.io import load_checkpoint, save_checkpoint
 from dememte.models import DeMemteVQSA, EMAVectorQuantizer2D, FSQQuantizer2D, SimVQLinearQuantizer2D, VectorQuantizer2D
 from dememte.tta import (
     EATALiteAdapter,
+    MemoryTentAdapter,
+    NoUpdateAdapter,
+    SourceFilterEATAAdapter,
     TentAdapter,
     collect_tta_bn_params,
+    collect_tta_ln_params,
+    configure_tta_layernorm,
     configure_tta_model,
+    latent_memory_loss,
     make_tta_optimizer,
 )
 from dememte.training import make_optimizer_vqsa, run_epoch_vqsa
@@ -391,3 +397,120 @@ def test_evaluate_dememte_tta_suite_reports_standard_and_tta_metrics():
     assert "tta_selection_rate_corrupt_avg" in metrics
     assert metrics["tta_method"] == "tent_bn"
     assert metrics["tta_base_variant"] == "tiny"
+
+
+# --- E7b: LayerNorm adaptation + latent-memory preservation -----------------
+
+
+def test_collect_tta_ln_params():
+    cfg = tiny_config(quantizer_type="ema_vq")
+    model = make_tiny_model(cfg)
+    params, names = collect_tta_ln_params(model)
+
+    assert params
+    assert all(name.endswith((".weight", ".bias")) for name in names)
+    assert all("attention" in name and ".norm" in name for name in names)
+    assert all("classifier" not in name for name in names)
+    assert all("projector" not in name for name in names)
+
+
+def test_configure_tta_layernorm_preserves_bn_running_stats():
+    cfg = tiny_config(quantizer_type="ema_vq", vqsa_dropout=0.2)
+    model = make_tiny_model(cfg)
+    configured = configure_tta_layernorm(model)
+    ln_params, _ = collect_tta_ln_params(configured)
+
+    assert configured.training is False
+    assert configured.vq.training is False
+    assert all(isinstance(m, nn.Dropout) and not m.training for m in configured.modules() if isinstance(m, nn.Dropout))
+    # LayerNorm affine is trainable, classifier and BN are frozen.
+    assert all(p.requires_grad for p in ln_params)
+    assert any(not p.requires_grad for name, p in configured.named_parameters() if "classifier" in name)
+    bn_params, _ = collect_tta_bn_params(configured)
+    assert all(not p.requires_grad for p in bn_params)
+    # BN keeps its source running statistics (the anti-collapse guarantee).
+    for module in configured.modules():
+        if isinstance(module, nn.BatchNorm2d):
+            assert module.track_running_stats is True
+            assert module.running_mean is not None
+            assert module.running_var is not None
+
+
+def test_no_update_adapter_does_not_change_params():
+    cfg = tiny_config(quantizer_type="ema_vq", vqsa_dropout=0.0)
+    model = configure_tta_model(make_tiny_model(cfg))
+    params, _ = collect_tta_bn_params(model)
+    optimizer = make_tta_optimizer(params, lr=1e-2, momentum=0.0)
+    adapter = NoUpdateAdapter(model, optimizer)
+    x = torch.randn(4, 3, 7, 7)
+    before = [p.detach().clone() for p in params]
+
+    logits, dbg = adapter(x, return_debug=True)
+
+    assert logits.shape == (4, cfg.num_classes)
+    assert "zq" in dbg
+    assert adapter.stats.updates == 0
+    assert adapter.stats.seen == 4
+    assert all(torch.allclose(b, a.detach()) for b, a in zip(before, params))
+
+
+def test_latent_memory_loss_zero_when_identical():
+    cfg = tiny_config(quantizer_type="ema_vq", vqsa_dropout=0.0)
+    model = make_tiny_model(cfg).eval()
+    x = torch.randn(4, 3, 7, 7)
+    _, _, dbg = model(x, return_debug=True)
+
+    loss = latent_memory_loss(dbg, dbg)
+    assert torch.allclose(loss, torch.zeros_like(loss), atol=1e-6)
+
+    # FSQ has soft_assign=None: the KL term must be skipped without error.
+    fsq_model = make_tiny_model(tiny_config(quantizer_type="fsq")).eval()
+    _, _, fsq_dbg = fsq_model(x, return_debug=True)
+    assert fsq_dbg["soft_assign"] is None
+    fsq_loss = latent_memory_loss(fsq_dbg, fsq_dbg)
+    assert torch.allclose(fsq_loss, torch.zeros_like(fsq_loss), atol=1e-6)
+
+
+def test_memory_tent_adapter_updates_only_layernorm():
+    cfg = tiny_config(quantizer_type="ema_vq", vqsa_dropout=0.0)
+    student = configure_tta_layernorm(make_tiny_model(cfg))
+    teacher = make_tiny_model(cfg)
+    ln_params, _ = collect_tta_ln_params(student)
+    bn_params, _ = collect_tta_bn_params(student)
+    optimizer = make_tta_optimizer(ln_params, lr=1e-1, momentum=0.0)
+    adapter = MemoryTentAdapter(student, optimizer, source_model=teacher)
+    x = torch.randn(4, 3, 7, 7)
+    ln_before = [p.detach().clone() for p in ln_params]
+    bn_before = [p.detach().clone() for p in bn_params]
+    vq_before = {k: v.detach().clone() for k, v in student.vq.state_dict().items()}
+
+    logits, dbg = adapter(x, return_debug=True)
+
+    assert logits.shape == (4, cfg.num_classes)
+    assert "z" in dbg and "zq" in dbg
+    assert adapter.stats.updates == 1
+    assert any(not torch.allclose(b, a.detach()) for b, a in zip(ln_before, ln_params))
+    assert all(torch.allclose(b, a.detach()) for b, a in zip(bn_before, bn_params))
+    for key, before in vq_before.items():
+        assert torch.allclose(before, student.vq.state_dict()[key])
+
+
+def test_source_filter_eata_uses_teacher_logits():
+    cfg = tiny_config(quantizer_type="ema_vq", vqsa_dropout=0.0)
+    student = configure_tta_layernorm(make_tiny_model(cfg))
+    teacher = make_tiny_model(cfg)
+    ln_params, _ = collect_tta_ln_params(student)
+    optimizer = make_tta_optimizer(ln_params, lr=1e-1, momentum=0.0)
+    # Impossible entropy margin on the teacher => no sample passes the filter.
+    adapter = SourceFilterEATAAdapter(
+        student, optimizer, num_classes=cfg.num_classes, source_model=teacher, e_margin=-1.0
+    )
+    x = torch.randn(4, 3, 7, 7)
+    ln_before = [p.detach().clone() for p in ln_params]
+
+    adapter(x)
+
+    assert adapter.stats.updates == 0
+    assert adapter.stats.selected == 0
+    assert adapter.stats.seen == 4
+    assert all(torch.allclose(b, a.detach()) for b, a in zip(ln_before, ln_params))

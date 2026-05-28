@@ -2,7 +2,20 @@
 
 from .config import BaselineConfig, E5Config, E6Config, AblationConfig
 from .data import build_loaders, seed_everything
-from .tta import EATALiteAdapter, TentAdapter, collect_tta_bn_params, configure_tta_model, make_tta_optimizer
+from .tta import (
+    EATALiteAdapter,
+    MemoryTentAdapter,
+    NoUpdateAdapter,
+    SourceFilterEATAAdapter,
+    TentAdapter,
+    collect_tta_bn_params,
+    collect_tta_ln_params,
+    configure_tta_layernorm,
+    configure_tta_model,
+    latent_memory_loss,
+    make_tta_optimizer,
+    softmax_entropy,
+)
 
 __all__ = [
     "BaselineConfig",
@@ -13,7 +26,14 @@ __all__ = [
     "seed_everything",
     "TentAdapter",
     "EATALiteAdapter",
+    "NoUpdateAdapter",
+    "MemoryTentAdapter",
+    "SourceFilterEATAAdapter",
     "collect_tta_bn_params",
+    "collect_tta_ln_params",
     "configure_tta_model",
+    "configure_tta_layernorm",
+    "latent_memory_loss",
     "make_tta_optimizer",
+    "softmax_entropy",
 ]

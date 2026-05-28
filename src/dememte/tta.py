@@ -1,8 +1,16 @@
 """Test-time adaptation helpers for DeMemte VQSA.
 
-Implements the E7 TTA variants:
+E7 TTA variants:
 - TENT-style entropy minimization over BatchNorm affine parameters.
 - EATA-lite reliable/non-redundant entropy minimization without Fisher.
+
+E7b conservative variants (avoid the BN batch-stats collapse):
+- LayerNorm-only adaptation surface (``configure_tta_layernorm`` /
+  ``collect_tta_ln_params``) that keeps BatchNorm on source running stats.
+- ``NoUpdateAdapter`` for the reported "BN Stats" baseline.
+- ``latent_memory_loss`` + ``MemoryTentAdapter`` for DeMemte pattern-completion
+  preservation of z/zq/codebook assignments against a frozen source teacher.
+- ``SourceFilterEATAAdapter`` whose reliability filter reads the teacher logits.
 """
 
 from __future__ import annotations
@@ -49,6 +57,25 @@ def collect_tta_bn_params(model: nn.Module) -> Tuple[List[nn.Parameter], List[st
     return params, names
 
 
+def collect_tta_ln_params(model: nn.Module) -> Tuple[List[nn.Parameter], List[str]]:
+    """Collect LayerNorm affine parameters (the batch-agnostic adaptation surface).
+
+    In DeMemte VQSA every ``nn.LayerNorm`` lives inside the self-attention blocks
+    (``vqsa.attention.*.norm{1,2}``); the classifier and projector use BatchNorm.
+    Adapting these affine params avoids the per-batch BN statistics that collapse
+    the model on small ordered test batches.
+    """
+    params: List[nn.Parameter] = []
+    names: List[str] = []
+    for module_name, module in model.named_modules():
+        if isinstance(module, nn.LayerNorm):
+            for param_name, param in module.named_parameters(recurse=False):
+                if param_name in {"weight", "bias"}:
+                    params.append(param)
+                    names.append(f"{module_name}.{param_name}")
+    return params, names
+
+
 def configure_tta_model(model: nn.Module) -> nn.Module:
     """Freeze the model except BN affine params and force BN batch statistics.
 
@@ -67,8 +94,74 @@ def configure_tta_model(model: nn.Module) -> nn.Module:
     return model
 
 
+def configure_tta_layernorm(model: nn.Module) -> nn.Module:
+    """Freeze the model except LayerNorm affine params; keep BN on source stats.
+
+    This is the E7b conservative configuration. Unlike :func:`configure_tta_model`,
+    it never touches BatchNorm running statistics: BN stays in eval mode using the
+    source running stats, which is what keeps the representation alive on small
+    ordered test batches. Only the LayerNorm ``weight``/``bias`` inside the VQSA
+    self-attention blocks (batch-agnostic) are made trainable. Dropout is disabled
+    and the EMA VQ codebook is frozen because the model stays in eval mode.
+    """
+    model.eval()
+    model.requires_grad_(False)
+    for module in model.modules():
+        if isinstance(module, nn.LayerNorm):
+            module.requires_grad_(True)
+    return model
+
+
 def make_tta_optimizer(params, lr: float = 2.5e-4, momentum: float = 0.9):
     return torch.optim.SGD(params, lr=lr, momentum=momentum)
+
+
+def _freeze_teacher(model: nn.Module) -> nn.Module:
+    """Put a source teacher model in frozen eval mode (running stats, no grad)."""
+    model.eval()
+    model.requires_grad_(False)
+    return model
+
+
+@torch.no_grad()
+def _teacher_forward(source_model: nn.Module, x: torch.Tensor):
+    """Run a frozen source teacher and return ``(logits, debug)``."""
+    logits, _, dbg = source_model(x, return_debug=True)
+    return logits, dbg
+
+
+def latent_memory_loss(
+    student_dbg: dict,
+    teacher_dbg: dict,
+    w_z: float = 1.0,
+    w_zq: float = 1.0,
+    w_assign: float = 1.0,
+) -> torch.Tensor:
+    """Pull the student's latent memory back toward the frozen source teacher.
+
+    Implements the DeMemte pattern-completion regularizer: preserve the shared
+    clean/corrupt latent space rather than only minimizing class entropy.
+
+    ``L = w_z·MSE(z, z_src) + w_zq·MSE(zq, zq_src) + w_assign·KL(p_src ‖ p)``
+
+    where ``p`` is the per-location soft codebook assignment. The KL term is
+    skipped when ``soft_assign`` is ``None`` (e.g. the FSQ quantizer).
+    """
+    z = student_dbg["z"]
+    loss = z.sum() * 0.0
+    if w_z:
+        loss = loss + w_z * F.mse_loss(z, teacher_dbg["z"].detach())
+    if w_zq:
+        loss = loss + w_zq * F.mse_loss(student_dbg["zq"], teacher_dbg["zq"].detach())
+    soft = student_dbg.get("soft_assign")
+    soft_src = teacher_dbg.get("soft_assign")
+    if w_assign and soft is not None and soft_src is not None:
+        log_p = soft.clamp_min(1e-8).log()
+        log_p_src = soft_src.clamp_min(1e-8).log().detach()
+        p_src = soft_src.detach()
+        kl = (p_src * (log_p_src - log_p)).sum(dim=-1).mean()
+        loss = loss + w_assign * kl
+    return loss
 
 
 class _BaseAdapter(nn.Module):
@@ -88,6 +181,26 @@ class _BaseAdapter(nn.Module):
         self.model.load_state_dict(self.model_state, strict=True)
         self.optimizer.load_state_dict(self.optimizer_state)
         self.stats = TTAStats()
+
+
+class NoUpdateAdapter(_BaseAdapter):
+    """Forward-only adapter: runs the configured model without any gradient step.
+
+    Used for the ``bn_stats_no_update`` baseline. Paired with a model configured
+    by :func:`configure_tta_model` it reproduces the literature "BN Stats"
+    baseline (per-batch statistics, no optimization), which is reported next to
+    ``source`` rather than used as an exclusion gate.
+    """
+
+    method_name = "no_update"
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor, return_debug: bool = False):
+        logits, _, dbg = self.model(x, return_debug=True)
+        self.stats.seen += x.size(0)
+        if return_debug:
+            return logits, dbg
+        return logits
 
 
 class TentAdapter(_BaseAdapter):
@@ -190,6 +303,141 @@ class EATALiteAdapter(_BaseAdapter):
                 self._update_model_probs(logits.softmax(dim=1)[selected_mask])
             elif reliable_count > 0 and self.current_model_probs is None:
                 self._update_model_probs(logits.softmax(dim=1)[reliable_mask])
+
+        if return_debug:
+            return logits, dbg
+        return logits
+
+
+class MemoryTentAdapter(_BaseAdapter):
+    """TENT over LayerNorm + DeMemte latent-memory preservation regularizer.
+
+    Adds :func:`latent_memory_loss` against a frozen source teacher to the
+    entropy objective, so adaptation preserves the shared clean/corrupt latent
+    space (pattern completion) instead of only collapsing class entropy.
+    """
+
+    method_name = "tent_ln_memreg"
+
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer,
+        source_model: nn.Module,
+        steps: int = 1,
+        episodic: bool = False,
+        w_z: float = 1.0,
+        w_zq: float = 1.0,
+        w_assign: float = 1.0,
+    ):
+        super().__init__(model, optimizer, steps=steps, episodic=episodic)
+        self.source_model = _freeze_teacher(source_model)
+        self.w_z = float(w_z)
+        self.w_zq = float(w_zq)
+        self.w_assign = float(w_assign)
+
+    @torch.enable_grad()
+    def forward(self, x: torch.Tensor, return_debug: bool = False):
+        if self.episodic:
+            self.reset()
+        _, teacher_dbg = _teacher_forward(self.source_model, x)
+        logits, dbg = None, None
+        for _ in range(self.steps):
+            self.optimizer.zero_grad(set_to_none=True)
+            logits, _, dbg = self.model(x, return_debug=True)
+            loss = softmax_entropy(logits).mean()
+            loss = loss + latent_memory_loss(dbg, teacher_dbg, self.w_z, self.w_zq, self.w_assign)
+            loss.backward()
+            self.optimizer.step()
+            self.stats.updates += 1
+            self.stats.reliable += x.size(0)
+            self.stats.selected += x.size(0)
+            self.stats.seen += x.size(0)
+        if return_debug:
+            return logits, dbg
+        return logits
+
+
+class SourceFilterEATAAdapter(EATALiteAdapter):
+    """EATA-lite whose reliability/diversity filter reads a frozen source teacher.
+
+    The entropy/diversity selection is computed from the teacher logits (which
+    are not contaminated by the adapting student), while the gradient is taken on
+    the student logits. Optional ``memory_weights`` adds :func:`latent_memory_loss`.
+    """
+
+    method_name = "eata_ln_srcfilter"
+
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer,
+        num_classes: int,
+        source_model: nn.Module,
+        steps: int = 1,
+        episodic: bool = False,
+        e_margin: float | None = None,
+        d_margin: float = 0.05,
+        prob_momentum: float = 0.9,
+        memory_weights: Tuple[float, float, float] | None = None,
+    ):
+        super().__init__(
+            model,
+            optimizer,
+            num_classes,
+            steps=steps,
+            episodic=episodic,
+            e_margin=e_margin,
+            d_margin=d_margin,
+            prob_momentum=prob_momentum,
+        )
+        self.source_model = _freeze_teacher(source_model)
+        self.memory_weights = memory_weights
+
+    @torch.enable_grad()
+    def forward(self, x: torch.Tensor, return_debug: bool = False):
+        if self.episodic:
+            self.reset()
+        teacher_logits, teacher_dbg = _teacher_forward(self.source_model, x)
+        logits, dbg = None, None
+        for _ in range(self.steps):
+            self.optimizer.zero_grad(set_to_none=True)
+            logits, _, dbg = self.model(x, return_debug=True)
+
+            # Reliability + diversity filtering on the descontaminated teacher logits.
+            filter_entropies = softmax_entropy(teacher_logits)
+            reliable_mask = filter_entropies < self.e_margin
+            reliable_count = int(reliable_mask.sum().item())
+            selected_mask = reliable_mask.clone()
+            if self.current_model_probs is not None and reliable_count > 0:
+                teacher_probs = teacher_logits.softmax(dim=1)
+                similarities = F.cosine_similarity(
+                    self.current_model_probs.unsqueeze(0),
+                    teacher_probs[reliable_mask],
+                    dim=1,
+                )
+                reliable_indices = reliable_mask.nonzero(as_tuple=False).flatten()
+                selected_mask[:] = False
+                selected_mask[reliable_indices[torch.abs(similarities) < self.d_margin]] = True
+
+            selected_count = int(selected_mask.sum().item())
+            self.stats.reliable += reliable_count
+            self.stats.selected += selected_count
+            self.stats.seen += x.size(0)
+
+            if selected_count > 0:
+                # Gradient on the student logits for the selected samples.
+                selected_entropies = softmax_entropy(logits)[selected_mask]
+                coeff = torch.exp(-(filter_entropies[selected_mask].detach() - self.e_margin))
+                loss = (selected_entropies * coeff).mean()
+                if self.memory_weights is not None:
+                    loss = loss + latent_memory_loss(dbg, teacher_dbg, *self.memory_weights)
+                loss.backward()
+                self.optimizer.step()
+                self.stats.updates += 1
+                self._update_model_probs(teacher_logits.softmax(dim=1)[selected_mask])
+            elif reliable_count > 0 and self.current_model_probs is None:
+                self._update_model_probs(teacher_logits.softmax(dim=1)[reliable_mask])
 
         if return_debug:
             return logits, dbg
