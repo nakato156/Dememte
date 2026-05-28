@@ -11,6 +11,18 @@ E7b conservative variants (avoid the BN batch-stats collapse):
 - ``latent_memory_loss`` + ``MemoryTentAdapter`` for DeMemte pattern-completion
   preservation of z/zq/codebook assignments against a frozen source teacher.
 - ``SourceFilterEATAAdapter`` whose reliability filter reads the teacher logits.
+
+E7c-A codebook plasticity (SimVQ only):
+- ``configure_tta_codebook`` / ``collect_tta_codebook_params`` expose the SimVQ
+  ``codebook_transform.weight`` (~16k params) as the adaptation surface upstream
+  of the straight-through estimator that blocks gradient to the codebook from
+  ``q_st``. ``MemoryTentAdapter`` / ``SourceFilterEATAAdapter`` are reused as-is.
+- ``SoftAssignTentAdapter`` minimizes entropy of the soft codebook assignment
+  (a path with live gradient to the codebook through ``softmax(-distances)``).
+- ``CodebookLossAdapter`` minimizes the VQ ``codebook_loss = MSE(q, z.detach())``
+  which pushes the codebook toward target-domain latents (real adaptation).
+- ``AlphaBNStatsAdapter`` (E7c-D) replaces ``projector.net.1`` BN stats with an
+  alpha-mix of running and batch stats (TTN/alpha-BN), no gradient.
 """
 
 from __future__ import annotations
@@ -44,6 +56,24 @@ def softmax_entropy(logits: torch.Tensor) -> torch.Tensor:
     return -(logits.softmax(dim=1) * logits.log_softmax(dim=1)).sum(dim=1)
 
 
+def soft_assign_entropy(dbg: dict) -> torch.Tensor:
+    """Mean per-location entropy of the soft codebook assignment, per sample.
+
+    ``soft_assign`` has shape ``(B, H, W, K)`` (a softmax over K codes at each
+    location) and depends on ``embedding.weight`` / ``codebook_transform.weight``
+    without any straight-through detach, so minimizing this entropy has a live
+    gradient to the codebook surface. Returns zeros for FSQ where
+    ``soft_assign is None``.
+    """
+    soft = dbg.get("soft_assign")
+    if soft is None:
+        b = dbg["z"].size(0)
+        return torch.zeros(b, device=dbg["z"].device)
+    probs = soft.clamp_min(1e-8)
+    entropy = -(probs * probs.log()).sum(dim=-1).mean(dim=(1, 2))
+    return entropy
+
+
 def collect_tta_bn_params(model: nn.Module) -> Tuple[List[nn.Parameter], List[str]]:
     """Collect BatchNorm affine parameters used by TENT/EATA."""
     params: List[nn.Parameter] = []
@@ -73,6 +103,36 @@ def collect_tta_ln_params(model: nn.Module) -> Tuple[List[nn.Parameter], List[st
                 if param_name in {"weight", "bias"}:
                     params.append(param)
                     names.append(f"{module_name}.{param_name}")
+    return params, names
+
+
+def collect_tta_codebook_params(model: nn.Module) -> Tuple[List[nn.Parameter], List[str]]:
+    """Collect the SimVQ ``codebook_transform.weight`` (the only adapter-reachable
+    codebook surface).
+
+    Vanilla VQ and EMA VQ both keep their straight-through estimator
+    ``q_st = z + (q - z).detach()`` upstream of every classifier path, which
+    zeros the gradient from ``zq`` to the codebook parameter. EMA VQ also
+    registers its codebook as a buffer rather than a Parameter. FSQ is
+    lookup-free. SimVQ alone exposes ``codebook_transform.weight`` (a
+    learnable linear reparametrization of the codebook base) and routes its
+    gradient through ``codebook_loss`` and ``soft_assign`` without detach.
+
+    This helper raises if the model does not contain a ``codebook_transform``
+    submodule (i.e. the quantizer is not ``simvq_linear``).
+    """
+    params: List[nn.Parameter] = []
+    names: List[str] = []
+    for module_name, module in model.named_modules():
+        transform = getattr(module, "codebook_transform", None)
+        if isinstance(transform, nn.Linear):
+            params.append(transform.weight)
+            names.append(f"{module_name}.codebook_transform.weight")
+    if not params:
+        raise ValueError(
+            "collect_tta_codebook_params requires a simvq_linear quantizer; "
+            "no nn.Linear codebook_transform was found."
+        )
     return params, names
 
 
@@ -109,6 +169,23 @@ def configure_tta_layernorm(model: nn.Module) -> nn.Module:
     for module in model.modules():
         if isinstance(module, nn.LayerNorm):
             module.requires_grad_(True)
+    return model
+
+
+def configure_tta_codebook(model: nn.Module) -> nn.Module:
+    """Freeze the model except the SimVQ ``codebook_transform.weight``.
+
+    The E7c-A adaptation surface. BatchNorm stays in eval on source running
+    stats; LayerNorm affine stays frozen; the backbone, projector, attention,
+    and classifier are all frozen. Only the linear reparametrization of the
+    codebook is trainable, so adaptation steps reshape the effective codebook
+    while leaving every batch-statistics path untouched.
+    """
+    model.eval()
+    model.requires_grad_(False)
+    params, _ = collect_tta_codebook_params(model)
+    for param in params:
+        param.requires_grad_(True)
     return model
 
 
@@ -358,6 +435,91 @@ class MemoryTentAdapter(_BaseAdapter):
         return logits
 
 
+class SoftAssignTentAdapter(_BaseAdapter):
+    """TENT-style entropy minimization on the soft codebook assignment.
+
+    Pure entropy on classifier logits cannot reach the codebook because the
+    quantizer's straight-through estimator ``q_st = z + (q - z).detach()`` zeros
+    the gradient from ``zq`` to ``embedding.weight`` / ``codebook_transform``.
+    Entropy on ``soft_assign`` does have live gradient to the codebook surface,
+    so this adapter is the minimal-mechanism positive for E7c-A.
+    """
+
+    method_name = "tent_codebook_softassign"
+
+    @torch.enable_grad()
+    def forward(self, x: torch.Tensor, return_debug: bool = False):
+        if self.episodic:
+            self.reset()
+        logits, dbg = None, None
+        for _ in range(self.steps):
+            self.optimizer.zero_grad(set_to_none=True)
+            logits, _, dbg = self.model(x, return_debug=True)
+            loss = soft_assign_entropy(dbg).mean()
+            loss.backward()
+            self.optimizer.step()
+            self.stats.updates += 1
+            self.stats.reliable += x.size(0)
+            self.stats.selected += x.size(0)
+            self.stats.seen += x.size(0)
+        if return_debug:
+            return logits, dbg
+        return logits
+
+
+class CodebookLossAdapter(_BaseAdapter):
+    """Adapt the codebook by minimizing the VQ ``codebook_loss`` at test time.
+
+    ``codebook_loss = MSE(q, z_e.detach())`` pulls the codebook entries toward
+    the target-domain latents ``z_e`` of the corrupted batch (``q = one_hot @ emb``
+    is direct, without any straight-through detach). This is the closest analogue
+    to real synaptic adaptation among the available signals: the codebook moves
+    toward the input distribution rather than collapsing class entropy.
+
+    Optional ``source_model`` + ``memory_weights`` adds the source-anchored
+    :func:`latent_memory_loss` (KL on ``soft_assign``) as an anti-drift term.
+    """
+
+    method_name = "codebook_loss_adapt"
+
+    def __init__(
+        self,
+        model: nn.Module,
+        optimizer,
+        source_model: nn.Module | None = None,
+        steps: int = 1,
+        episodic: bool = False,
+        memory_weights: Tuple[float, float, float] | None = None,
+    ):
+        super().__init__(model, optimizer, steps=steps, episodic=episodic)
+        self.source_model = _freeze_teacher(source_model) if source_model is not None else None
+        self.memory_weights = memory_weights
+
+    @torch.enable_grad()
+    def forward(self, x: torch.Tensor, return_debug: bool = False):
+        if self.episodic:
+            self.reset()
+        teacher_dbg = None
+        if self.source_model is not None and self.memory_weights is not None:
+            _, teacher_dbg = _teacher_forward(self.source_model, x)
+        logits, dbg = None, None
+        for _ in range(self.steps):
+            self.optimizer.zero_grad(set_to_none=True)
+            logits, _, dbg = self.model(x, return_debug=True)
+            loss = dbg["codebook_loss"]
+            if teacher_dbg is not None:
+                loss = loss + latent_memory_loss(dbg, teacher_dbg, *self.memory_weights)
+            loss.backward()
+            self.optimizer.step()
+            self.stats.updates += 1
+            self.stats.reliable += x.size(0)
+            self.stats.selected += x.size(0)
+            self.stats.seen += x.size(0)
+        if return_debug:
+            return logits, dbg
+        return logits
+
+
 class SourceFilterEATAAdapter(EATALiteAdapter):
     """EATA-lite whose reliability/diversity filter reads a frozen source teacher.
 
@@ -439,6 +601,103 @@ class SourceFilterEATAAdapter(EATALiteAdapter):
             elif reliable_count > 0 and self.current_model_probs is None:
                 self._update_model_probs(teacher_logits.softmax(dim=1)[reliable_mask])
 
+        if return_debug:
+            return logits, dbg
+        return logits
+
+
+class AlphaBNStatsAdapter(nn.Module):
+    """E7c-D / TTN: alpha-mix of running stats and batch stats at ``projector.net.1``.
+
+    Replaces only the projector BatchNorm forward (the BN immediately downstream
+    of the frozen backbone, immediately upstream of the VQ codebook) with an
+    alpha-mixed statistic where ``alpha`` is the **weight on the source running
+    stats**:
+
+    ``mean = alpha * running_mean + (1 - alpha) * batch_mean``
+    ``var  = alpha * running_var  + (1 - alpha) * batch_var``
+
+    Use ``alpha`` close to 1.0 (e.g. 0.90-0.95) to keep most of the source
+    running statistics and only inject a small batch correction; ``alpha=1.0``
+    is a true no-op (identical to source BN eval), ``alpha=0.0`` reproduces the
+    ``bn_stats_no_update`` collapse. No gradient steps, no learnable parameters.
+    Implemented via a forward hook that returns the alpha-mixed BN output;
+    ``close()`` and ``reset()`` remove the hook to restore the original BN
+    forward.
+    """
+
+    method_name = "ttn_alpha_bn"
+
+    def __init__(
+        self,
+        model: nn.Module,
+        alpha: float = 0.1,
+        target_module_name: str = "vqsa.projector.net.1",
+    ):
+        super().__init__()
+        self.model = model
+        self.model.eval()
+        self.model.requires_grad_(False)
+        self.alpha = float(alpha)
+        self.target_module_name = str(target_module_name)
+        self.stats = TTAStats()
+        target = self._resolve_target()
+        if not isinstance(target, nn.BatchNorm2d):
+            raise TypeError(
+                f"AlphaBNStatsAdapter target {target_module_name!r} must be nn.BatchNorm2d, "
+                f"got {type(target).__name__}"
+            )
+        self._target = target
+        self._handle = target.register_forward_hook(self._make_hook(self.alpha))
+
+    def _resolve_target(self) -> nn.Module:
+        return self.model.get_submodule(self.target_module_name)
+
+    @staticmethod
+    def _make_hook(alpha: float):
+        def hook(module: nn.BatchNorm2d, inputs, output):
+            x = inputs[0]
+            if x.dim() == 4:
+                dims = (0, 2, 3)
+            else:
+                dims = (0,)
+            batch_mean = x.mean(dim=dims).detach()
+            batch_var = x.var(dim=dims, unbiased=False).detach()
+            running_mean = module.running_mean if module.running_mean is not None else batch_mean
+            running_var = module.running_var if module.running_var is not None else batch_var
+            mixed_mean = alpha * running_mean + (1.0 - alpha) * batch_mean
+            mixed_var = alpha * running_var + (1.0 - alpha) * batch_var
+            return F.batch_norm(
+                x,
+                mixed_mean,
+                mixed_var,
+                module.weight,
+                module.bias,
+                training=False,
+                momentum=0.0,
+                eps=module.eps,
+            )
+
+        return hook
+
+    def reset(self) -> None:
+        self.stats = TTAStats()
+
+    def close(self) -> None:
+        if self._handle is not None:
+            self._handle.remove()
+            self._handle = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor, return_debug: bool = False):
+        logits, _, dbg = self.model(x, return_debug=True)
+        self.stats.seen += x.size(0)
         if return_debug:
             return logits, dbg
         return logits

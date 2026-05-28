@@ -8,17 +8,23 @@ from dememte.evaluation import evaluate_dememte_suite, evaluate_dememte_tta_suit
 from dememte.io import load_checkpoint, save_checkpoint
 from dememte.models import DeMemteVQSA, EMAVectorQuantizer2D, FSQQuantizer2D, SimVQLinearQuantizer2D, VectorQuantizer2D
 from dememte.tta import (
+    AlphaBNStatsAdapter,
+    CodebookLossAdapter,
     EATALiteAdapter,
     MemoryTentAdapter,
     NoUpdateAdapter,
+    SoftAssignTentAdapter,
     SourceFilterEATAAdapter,
     TentAdapter,
     collect_tta_bn_params,
+    collect_tta_codebook_params,
     collect_tta_ln_params,
+    configure_tta_codebook,
     configure_tta_layernorm,
     configure_tta_model,
     latent_memory_loss,
     make_tta_optimizer,
+    soft_assign_entropy,
 )
 from dememte.training import make_optimizer_vqsa, run_epoch_vqsa
 
@@ -514,3 +520,210 @@ def test_source_filter_eata_uses_teacher_logits():
     assert adapter.stats.selected == 0
     assert adapter.stats.seen == 4
     assert all(torch.allclose(b, a.detach()) for b, a in zip(ln_before, ln_params))
+
+
+# --- E7c-A: codebook plasticity (SimVQ) -------------------------------------
+
+
+def test_collect_tta_codebook_params_returns_only_transform():
+    cfg = tiny_config(quantizer_type="simvq_linear")
+    model = make_tiny_model(cfg)
+    params, names = collect_tta_codebook_params(model)
+
+    assert len(params) == 1
+    assert names == ["vqsa.vq.codebook_transform.weight"]
+    assert params[0] is model.vq.codebook_transform.weight
+
+    # Non-SimVQ quantizers have no learnable codebook_transform surface.
+    for non_simvq in ("vq", "ema_vq", "fsq"):
+        bad = make_tiny_model(tiny_config(quantizer_type=non_simvq))
+        with pytest.raises(ValueError, match="simvq_linear"):
+            collect_tta_codebook_params(bad)
+
+
+def test_configure_tta_codebook_freezes_everything_else():
+    cfg = tiny_config(quantizer_type="simvq_linear", vqsa_dropout=0.2)
+    model = configure_tta_codebook(make_tiny_model(cfg))
+
+    assert model.training is False
+    assert all(isinstance(m, nn.Dropout) and not m.training for m in model.modules() if isinstance(m, nn.Dropout))
+    # Only codebook_transform is trainable.
+    cb_params, _ = collect_tta_codebook_params(model)
+    assert all(p.requires_grad for p in cb_params)
+    for name, p in model.named_parameters():
+        if "codebook_transform" in name:
+            assert p.requires_grad
+        else:
+            assert not p.requires_grad, f"expected {name} frozen"
+    # BN keeps its source running statistics: nothing was touched.
+    for module in model.modules():
+        if isinstance(module, nn.BatchNorm2d):
+            assert module.track_running_stats is True
+            assert module.running_mean is not None
+            assert module.running_var is not None
+
+
+def test_tent_codebook_pure_is_structurally_inert():
+    """Entropy on logits has *no graph at all* back to codebook_transform: the
+    straight-through ``q_st = z + (q - z).detach()`` is the only path from the
+    codebook to the classifier, and it severs the gradient. We confirm this by
+    showing the entropy loss has no ``grad_fn`` and that the codebook weight is
+    unchanged if a backward step is attempted (it would raise)."""
+    cfg = tiny_config(quantizer_type="simvq_linear", vqsa_dropout=0.0)
+    model = configure_tta_codebook(make_tiny_model(cfg))
+    params, _ = collect_tta_codebook_params(model)
+    weight_before = params[0].detach().clone()
+
+    # Re-create the TENT loss path manually to inspect grad_fn:
+    logits, _, _ = model(torch.randn(4, 3, 7, 7), return_debug=True)
+    entropy = -(logits.softmax(dim=1) * logits.log_softmax(dim=1)).sum(dim=1).mean()
+    # codebook is the ONLY trainable param, so entropy must have requires_grad=False.
+    assert not entropy.requires_grad, (
+        "tent_codebook entropy must be detached from the codebook: straight-through "
+        "blocks gradient and there are no other trainable params"
+    )
+
+    # Attempting an actual TentAdapter step raises because the loss has no grad_fn.
+    optimizer = make_tta_optimizer(params, lr=1e-1, momentum=0.0)
+    adapter = TentAdapter(model, optimizer)
+    with pytest.raises(RuntimeError, match="does not require grad"):
+        adapter(torch.randn(4, 3, 7, 7))
+
+    # Weight is untouched.
+    assert torch.allclose(weight_before, params[0].detach(), atol=1e-7)
+
+
+def test_soft_assign_tent_adapter_moves_codebook_transform():
+    """Entropy on soft_assign has live gradient to codebook_transform; weight must move."""
+    cfg = tiny_config(quantizer_type="simvq_linear", vqsa_dropout=0.0)
+    model = configure_tta_codebook(make_tiny_model(cfg))
+    teacher = make_tiny_model(cfg)
+    teacher.load_state_dict(model.state_dict())
+    params, _ = collect_tta_codebook_params(model)
+    optimizer = make_tta_optimizer(params, lr=1e-1, momentum=0.0)
+    adapter = SoftAssignTentAdapter(model, optimizer)
+    x = torch.randn(4, 3, 7, 7)
+    weight_before = params[0].detach().clone()
+
+    logits, dbg = adapter(x, return_debug=True)
+
+    assert logits.shape == (4, cfg.num_classes)
+    assert dbg["soft_assign"] is not None
+    assert adapter.stats.updates == 1
+    assert not torch.allclose(weight_before, params[0].detach(), atol=1e-6), (
+        "soft-assign TENT should move codebook_transform.weight"
+    )
+    # zq drifts away from teacher because the codebook moved.
+    with torch.no_grad():
+        _, _, dbg_t = teacher(x, return_debug=True)
+        zq_drift = (dbg["zq"].detach() - dbg_t["zq"]).pow(2).mean().sqrt().item()
+    assert zq_drift > 1e-5
+
+
+def test_codebook_loss_adapter_reduces_codebook_loss():
+    cfg = tiny_config(quantizer_type="simvq_linear", vqsa_dropout=0.0)
+    model = configure_tta_codebook(make_tiny_model(cfg))
+    params, _ = collect_tta_codebook_params(model)
+    optimizer = make_tta_optimizer(params, lr=1.0, momentum=0.0)
+    adapter = CodebookLossAdapter(model, optimizer)
+    x = torch.randn(4, 3, 7, 7)
+    with torch.no_grad():
+        _, _, dbg0 = model(x, return_debug=True)
+        loss_before = float(dbg0["codebook_loss"].item())
+
+    adapter(x)
+
+    with torch.no_grad():
+        _, _, dbg1 = model(x, return_debug=True)
+        loss_after = float(dbg1["codebook_loss"].item())
+    assert loss_after < loss_before, f"codebook_loss must drop: before={loss_before} after={loss_after}"
+    assert adapter.stats.updates == 1
+
+
+def test_alpha_bn_adapter_replaces_and_restores_projector_bn_forward():
+    cfg = tiny_config(quantizer_type="simvq_linear", vqsa_dropout=0.0)
+    model = make_tiny_model(cfg).eval()
+    target = model.get_submodule("vqsa.projector.net.1")
+    assert isinstance(target, nn.BatchNorm2d)
+    # Capture a real BN input by hooking it once before the adapter is built.
+    captured = {}
+
+    def capture(_module, inputs, _output):
+        captured["x"] = inputs[0].detach().clone()
+
+    h = target.register_forward_hook(capture)
+    with torch.no_grad():
+        _ = model(torch.randn(2, 3, 7, 7))
+    h.remove()
+    bn_input = captured["x"]
+
+    alpha = 0.25
+    adapter = AlphaBNStatsAdapter(model, alpha=alpha)
+    x_full = torch.randn(2, 3, 7, 7)
+    with torch.no_grad():
+        _ = adapter(x_full)
+    # After running, the hook is still installed; compute expected alpha-mix manually.
+    with torch.no_grad():
+        running_mean, running_var = target.running_mean, target.running_var
+        batch_mean = bn_input.mean(dim=(0, 2, 3))
+        batch_var = bn_input.var(dim=(0, 2, 3), unbiased=False)
+        mixed_mean = alpha * running_mean + (1.0 - alpha) * batch_mean
+        mixed_var = alpha * running_var + (1.0 - alpha) * batch_var
+        import torch.nn.functional as F
+        expected = F.batch_norm(
+            bn_input, mixed_mean, mixed_var, target.weight, target.bias,
+            training=False, momentum=0.0, eps=target.eps,
+        )
+        actual = target(bn_input)
+    assert torch.allclose(actual, expected, atol=1e-6)
+
+    # close() removes the hook so the original BN forward is back.
+    adapter.close()
+    with torch.no_grad():
+        restored = target(bn_input)
+        original_expected = F.batch_norm(
+            bn_input, target.running_mean, target.running_var, target.weight, target.bias,
+            training=False, momentum=0.0, eps=target.eps,
+        )
+    assert torch.allclose(restored, original_expected, atol=1e-6)
+    # The alpha-mixed output differs from the source BN (unless alpha happened to be 1.0).
+    assert not torch.allclose(actual, restored, atol=1e-3)
+
+
+def test_evaluate_dememte_tta_with_teacher_reports_drift_columns():
+    cfg = tiny_config(quantizer_type="simvq_linear", vqsa_layers=0, vqsa_use_self_attention=False)
+    x = torch.randn(4, 3, 7, 7)
+    y = torch.tensor([0, 1, 2, 1])
+    loader = DataLoader(TensorDataset(x, y), batch_size=2)
+    suite = {"gaussian_noise": [0.1]}
+
+    teacher = make_tiny_model(cfg).eval()
+    teacher.requires_grad_(False)
+
+    def factory():
+        model = configure_tta_codebook(make_tiny_model(cfg))
+        model.load_state_dict(teacher.state_dict())
+        params, _ = collect_tta_codebook_params(model)
+        optimizer = make_tta_optimizer(params, lr=1e-3, momentum=0.0)
+        return SoftAssignTentAdapter(model, optimizer)
+
+    metrics = evaluate_dememte_tta_suite(
+        factory,
+        loader,
+        device="cpu",
+        suite=suite,
+        tta_method="tent_codebook_softassign",
+        tta_base_variant="tiny_simvq",
+        teacher_model=teacher,
+    )
+
+    for key in ("z_drift", "zq_drift", "assignment_churn", "kl_assign_src"):
+        assert f"{key}_clean" in metrics
+        assert f"{key}_corrupt_avg" in metrics
+    # Source-vs-source (clean, teacher loaded with same state) starts at zero drift
+    # before any adapter step, but adaptation may shift soft-assign minutely. The
+    # corruption drift should be non-negative and finite.
+    assert metrics["zq_drift_corrupt_avg"] >= 0.0
+    assert torch.isfinite(torch.tensor(metrics["kl_assign_src_corrupt_avg"]))
+    assert "hard_usage_delta_vs_src_clean" in metrics
+    assert "dead_code_fraction_delta_vs_src_corrupt_avg" in metrics

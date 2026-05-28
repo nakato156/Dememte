@@ -3,17 +3,23 @@
 from .config import BaselineConfig, E5Config, E6Config, AblationConfig
 from .data import build_loaders, seed_everything
 from .tta import (
+    AlphaBNStatsAdapter,
+    CodebookLossAdapter,
     EATALiteAdapter,
     MemoryTentAdapter,
     NoUpdateAdapter,
+    SoftAssignTentAdapter,
     SourceFilterEATAAdapter,
     TentAdapter,
     collect_tta_bn_params,
+    collect_tta_codebook_params,
     collect_tta_ln_params,
+    configure_tta_codebook,
     configure_tta_layernorm,
     configure_tta_model,
     latent_memory_loss,
     make_tta_optimizer,
+    soft_assign_entropy,
     softmax_entropy,
 )
 
@@ -29,11 +35,17 @@ __all__ = [
     "NoUpdateAdapter",
     "MemoryTentAdapter",
     "SourceFilterEATAAdapter",
+    "SoftAssignTentAdapter",
+    "CodebookLossAdapter",
+    "AlphaBNStatsAdapter",
     "collect_tta_bn_params",
     "collect_tta_ln_params",
+    "collect_tta_codebook_params",
     "configure_tta_model",
     "configure_tta_layernorm",
+    "configure_tta_codebook",
     "latent_memory_loss",
     "make_tta_optimizer",
     "softmax_entropy",
+    "soft_assign_entropy",
 ]

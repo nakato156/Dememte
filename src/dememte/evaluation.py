@@ -25,6 +25,20 @@ VQSA_KEYS = [
 ]
 
 
+# E7c-A diagnostics that compare the in-flight student against a frozen source
+# teacher per batch. ``z_drift`` / ``zq_drift`` are RMS distances per sample,
+# ``assignment_churn`` is the fraction of token positions whose hard codebook
+# index moved relative to the teacher, and ``kl_assign_src`` is the KL of the
+# teacher soft assignment relative to the student soft assignment. All are zero
+# for ``source`` (student == teacher) and grow with codebook plasticity.
+TEACHER_DIAG_KEYS = [
+    "z_drift",
+    "zq_drift",
+    "assignment_churn",
+    "kl_assign_src",
+]
+
+
 def _trapezoid(y, x=None, dx=1.0, axis=-1):
     integrate = getattr(np, "trapezoid", None)
     if integrate is None:
@@ -130,6 +144,52 @@ def _vqsa_batch_diagnostics(dbg: dict, batch_size: int) -> dict:
         "hard_perplexity": hard_perplexity,
         "dead_code_fraction": dead_code_fraction,
         "attention_entropy": attention_entropy,
+    }
+
+
+def _teacher_batch_diagnostics(
+    student_dbg: dict,
+    teacher_dbg: dict,
+    batch_size: int,
+) -> dict:
+    """Per-sample drift / churn / KL of the student against the frozen teacher."""
+    device = student_dbg["z"].device
+    zeros = torch.zeros(batch_size, device=device)
+    z_s, z_t = student_dbg.get("z"), teacher_dbg.get("z")
+    zq_s, zq_t = student_dbg.get("zq"), teacher_dbg.get("zq")
+    if z_s is not None and z_t is not None:
+        z_drift = (z_s - z_t).pow(2).mean(dim=(1, 2, 3)).clamp_min(0.0).sqrt().detach()
+    else:
+        z_drift = zeros
+    if zq_s is not None and zq_t is not None:
+        zq_drift = (zq_s - zq_t).pow(2).mean(dim=(1, 2, 3)).clamp_min(0.0).sqrt().detach()
+    else:
+        zq_drift = zeros
+
+    idx_s = student_dbg.get("encoding_indices")
+    idx_t = teacher_dbg.get("encoding_indices")
+    if idx_s is not None and idx_t is not None:
+        churn = (
+            idx_s.detach().reshape(batch_size, -1) != idx_t.detach().reshape(batch_size, -1)
+        ).float().mean(dim=1)
+    else:
+        churn = zeros
+
+    soft_s = student_dbg.get("soft_assign")
+    soft_t = teacher_dbg.get("soft_assign")
+    if soft_s is not None and soft_t is not None:
+        log_p = soft_s.clamp_min(1e-8).log()
+        log_p_t = soft_t.clamp_min(1e-8).log()
+        kl_per_token = (soft_t.detach() * (log_p_t.detach() - log_p.detach())).sum(dim=-1)
+        kl = kl_per_token.mean(dim=(1, 2))
+    else:
+        kl = zeros
+
+    return {
+        "z_drift": z_drift,
+        "zq_drift": zq_drift,
+        "assignment_churn": churn,
+        "kl_assign_src": kl,
     }
 
 
@@ -307,11 +367,14 @@ def evaluate_dememte_tta(
     return_predictions: bool = False,
     tta_method: str = "tta",
     tta_base_variant: str = "unknown",
+    teacher_model=None,
 ):
     total = 0
     correct = 0
     diag_values = {k: [] for k in VQSA_KEYS}
+    teacher_diag_values = {k: [] for k in TEACHER_DIAG_KEYS}
     hard_counts = None
+    teacher_hard_counts = None
     conf_all, corr_all, nll_all, brier_all = [], [], [], []
     prediction_rows = []
 
@@ -333,6 +396,12 @@ def evaluate_dememte_tta(
         brier = ((probs - one_hot) ** 2).sum(dim=1)
         diagnostics = _vqsa_batch_diagnostics(dbg, y.size(0))
         hard_counts = _add_global_hard_counts(hard_counts, dbg)
+        teacher_diagnostics = None
+        if teacher_model is not None:
+            with torch.no_grad():
+                _, _, teacher_dbg = teacher_model(x_eval, return_debug=True)
+            teacher_diagnostics = _teacher_batch_diagnostics(dbg, teacher_dbg, y.size(0))
+            teacher_hard_counts = _add_global_hard_counts(teacher_hard_counts, teacher_dbg)
 
         total += y.size(0)
         correct += ok.sum().item()
@@ -342,6 +411,9 @@ def evaluate_dememte_tta(
         brier_all.extend(brier.detach().cpu().tolist())
         for key in VQSA_KEYS:
             diag_values[key].append(diagnostics[key].detach().cpu())
+        if teacher_diagnostics is not None:
+            for key in TEACHER_DIAG_KEYS:
+                teacher_diag_values[key].append(teacher_diagnostics[key].detach().cpu())
 
         if return_predictions:
             for j in range(y.size(0)):
@@ -360,6 +432,9 @@ def evaluate_dememte_tta(
                 }
                 for key in VQSA_KEYS:
                     row[key] = float(diagnostics[key][j].item())
+                if teacher_diagnostics is not None:
+                    for key in TEACHER_DIAG_KEYS:
+                        row[key] = float(teacher_diagnostics[key][j].item())
                 prediction_rows.append(row)
             sample_offset += y.size(0)
 
@@ -377,6 +452,16 @@ def evaluate_dememte_tta(
     for key, values in diag_values.items():
         result.update(_signal_summary(values, key))
     result.update(_global_hard_summary(hard_counts))
+    if teacher_model is not None:
+        for key, values in teacher_diag_values.items():
+            result.update(_signal_summary(values, key))
+        teacher_global = _global_hard_summary(teacher_hard_counts)
+        result["hard_usage_delta_vs_src"] = result["hard_usage_mean"] - teacher_global["hard_usage_mean"]
+        result["dead_code_fraction_delta_vs_src"] = (
+            result["dead_code_fraction_mean"] - teacher_global["dead_code_fraction_mean"]
+        )
+        result["teacher_hard_usage_mean"] = teacher_global["hard_usage_mean"]
+        result["teacher_dead_code_fraction_mean"] = teacher_global["dead_code_fraction_mean"]
     if return_predictions:
         result["predictions"] = prediction_rows
     return result
@@ -390,6 +475,7 @@ def evaluate_dememte_tta_suite(
     suite=None,
     tta_method="tta",
     tta_base_variant="unknown",
+    teacher_model=None,
 ):
     suite = suite or STRICT_SUITE
     clean = evaluate_dememte_tta(
@@ -401,6 +487,7 @@ def evaluate_dememte_tta_suite(
         return_predictions=return_predictions,
         tta_method=tta_method,
         tta_base_variant=tta_base_variant,
+        teacher_model=teacher_model,
     )
     corrupt_records = {}
     for corr, levels in suite.items():
@@ -414,6 +501,7 @@ def evaluate_dememte_tta_suite(
                 return_predictions=return_predictions,
                 tta_method=tta_method,
                 tta_base_variant=tta_base_variant,
+                teacher_model=teacher_model,
             )
             for l in levels
         ]
@@ -441,6 +529,13 @@ def evaluate_dememte_tta_suite(
     for key in VQSA_KEYS:
         metrics[f"{key}_clean"] = clean[f"{key}_mean"]
         metrics[f"{key}_corrupt_avg"] = float(np.mean([r[f"{key}_mean"] for r in all_corrupt]))
+    if teacher_model is not None:
+        for key in TEACHER_DIAG_KEYS:
+            metrics[f"{key}_clean"] = clean[f"{key}_mean"]
+            metrics[f"{key}_corrupt_avg"] = float(np.mean([r[f"{key}_mean"] for r in all_corrupt]))
+        for key in ("hard_usage_delta_vs_src", "dead_code_fraction_delta_vs_src"):
+            metrics[f"{key}_clean"] = clean[key]
+            metrics[f"{key}_corrupt_avg"] = float(np.mean([r[key] for r in all_corrupt]))
     return metrics
 
 
