@@ -39,6 +39,32 @@ TEACHER_DIAG_KEYS = [
 ]
 
 
+# E10 hippocampal-memory diagnostics. These are populated only when the active
+# adapter publishes them into the ``debug`` dict (``HippocampalMemoryAdapter``);
+# every other adapter / source evaluation leaves them at zero. Per-sample
+# tensors of shape ``(B,)`` so they aggregate via ``_signal_summary``.
+#
+# - ``recall_sharpness``: ``max(softmax_weights)`` over the recall — how much
+#   the recall concentrates on a single codebook entry. High = clear Hopfield
+#   basin (Ramsauer et al. 2021); low = ambiguous query.
+# - ``completion_amount``: ``‖z_pool_T − z_pool_0‖ / ‖z_pool_0‖`` — relative
+#   magnitude of the pattern-completion movement.
+# - ``g_mean``: familiarity / unfamiliarity gate value used to compute
+#   ``λ_eff = λ_max · g`` per sample.
+# - ``traj_max_step``: max of per-iteration ``‖z_{t+1} − z_t‖`` across the
+#   completion loop. Detects divergence (Kim et al. 2021 Lipschitz cap).
+# - ``episodic_buffer_churn``: fraction of episodic-buffer slots that drifted
+#   from their init state — measures how much episodic plasticity actually
+#   happened.
+MEMORY_DIAG_KEYS = [
+    "recall_sharpness",
+    "completion_amount",
+    "g_mean",
+    "traj_max_step",
+    "episodic_buffer_churn",
+]
+
+
 def _trapezoid(y, x=None, dx=1.0, axis=-1):
     integrate = getattr(np, "trapezoid", None)
     if integrate is None:
@@ -191,6 +217,29 @@ def _teacher_batch_diagnostics(
         "assignment_churn": churn,
         "kl_assign_src": kl,
     }
+
+
+def _memory_batch_diagnostics(dbg: dict, batch_size: int) -> dict | None:
+    """Extract HippocampalMemoryAdapter diagnostics from ``dbg``.
+
+    Returns ``None`` if the dbg dict doesn't carry any memory keys (i.e. the
+    adapter is not the hippocampal one), which lets the eval loop skip them
+    cleanly.
+    """
+    if "recall_sharpness" not in dbg:
+        return None
+    device = dbg["z"].device
+    out: dict = {}
+    for key in MEMORY_DIAG_KEYS:
+        value = dbg.get(key)
+        if value is None:
+            out[key] = torch.zeros(batch_size, device=device)
+            continue
+        tensor = value.detach()
+        if tensor.dim() == 0:
+            tensor = tensor.expand(batch_size).clone()
+        out[key] = tensor.to(device)
+    return out
 
 
 def _add_global_hard_counts(counts: torch.Tensor | None, dbg: dict) -> torch.Tensor | None:
@@ -373,6 +422,8 @@ def evaluate_dememte_tta(
     correct = 0
     diag_values = {k: [] for k in VQSA_KEYS}
     teacher_diag_values = {k: [] for k in TEACHER_DIAG_KEYS}
+    memory_diag_values = {k: [] for k in MEMORY_DIAG_KEYS}
+    has_memory_diag = False
     hard_counts = None
     teacher_hard_counts = None
     conf_all, corr_all, nll_all, brier_all = [], [], [], []
@@ -402,6 +453,9 @@ def evaluate_dememte_tta(
                 _, _, teacher_dbg = teacher_model(x_eval, return_debug=True)
             teacher_diagnostics = _teacher_batch_diagnostics(dbg, teacher_dbg, y.size(0))
             teacher_hard_counts = _add_global_hard_counts(teacher_hard_counts, teacher_dbg)
+        memory_diagnostics = _memory_batch_diagnostics(dbg, y.size(0))
+        if memory_diagnostics is not None:
+            has_memory_diag = True
 
         total += y.size(0)
         correct += ok.sum().item()
@@ -414,6 +468,9 @@ def evaluate_dememte_tta(
         if teacher_diagnostics is not None:
             for key in TEACHER_DIAG_KEYS:
                 teacher_diag_values[key].append(teacher_diagnostics[key].detach().cpu())
+        if memory_diagnostics is not None:
+            for key in MEMORY_DIAG_KEYS:
+                memory_diag_values[key].append(memory_diagnostics[key].detach().cpu())
 
         if return_predictions:
             for j in range(y.size(0)):
@@ -435,6 +492,9 @@ def evaluate_dememte_tta(
                 if teacher_diagnostics is not None:
                     for key in TEACHER_DIAG_KEYS:
                         row[key] = float(teacher_diagnostics[key][j].item())
+                if memory_diagnostics is not None:
+                    for key in MEMORY_DIAG_KEYS:
+                        row[key] = float(memory_diagnostics[key][j].item())
                 prediction_rows.append(row)
             sample_offset += y.size(0)
 
@@ -462,6 +522,9 @@ def evaluate_dememte_tta(
         )
         result["teacher_hard_usage_mean"] = teacher_global["hard_usage_mean"]
         result["teacher_dead_code_fraction_mean"] = teacher_global["dead_code_fraction_mean"]
+    if has_memory_diag:
+        for key, values in memory_diag_values.items():
+            result.update(_signal_summary(values, key))
     if return_predictions:
         result["predictions"] = prediction_rows
     return result
@@ -536,6 +599,15 @@ def evaluate_dememte_tta_suite(
         for key in ("hard_usage_delta_vs_src", "dead_code_fraction_delta_vs_src"):
             metrics[f"{key}_clean"] = clean[key]
             metrics[f"{key}_corrupt_avg"] = float(np.mean([r[key] for r in all_corrupt]))
+    # Hippocampal-memory diagnostics are present only when the adapter emits
+    # them.  We detect this off the clean record (mean key always exists when
+    # has_memory_diag was true for that call).
+    if f"{MEMORY_DIAG_KEYS[0]}_mean" in clean:
+        for key in MEMORY_DIAG_KEYS:
+            metrics[f"{key}_clean"] = clean[f"{key}_mean"]
+            metrics[f"{key}_corrupt_avg"] = float(
+                np.mean([r.get(f"{key}_mean", 0.0) for r in all_corrupt])
+            )
     return metrics
 
 

@@ -2,6 +2,15 @@
 
 from .config import BaselineConfig, E5Config, E6Config, AblationConfig
 from .data import build_loaders, seed_everything
+from .memory import (
+    EpisodicBuffer,
+    HippocampalConfig,
+    HippocampalMemoryAdapter,
+    associative_recall,
+    effective_codebook,
+    familiarity_gate,
+    pattern_completion,
+)
 from .tta import (
     AlphaBNStatsAdapter,
     CodebookLossAdapter,
@@ -48,4 +57,12 @@ __all__ = [
     "make_tta_optimizer",
     "softmax_entropy",
     "soft_assign_entropy",
+    # E10 hippocampal memory module.
+    "HippocampalConfig",
+    "HippocampalMemoryAdapter",
+    "EpisodicBuffer",
+    "associative_recall",
+    "familiarity_gate",
+    "pattern_completion",
+    "effective_codebook",
 ]
