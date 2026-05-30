@@ -2,6 +2,12 @@
 
 from .config import BaselineConfig, E5Config, E6Config, AblationConfig
 from .data import build_loaders, seed_everything
+from .codebook_repair import (
+    CodebookRepairConfig,
+    LocalCodebookRepairAdapter,
+    calibrate_repair_thresholds,
+    quantize_with_codebook_view,
+)
 from .memory import (
     EpisodicBuffer,
     HippocampalConfig,
@@ -46,6 +52,11 @@ __all__ = [
     "AblationConfig",
     "build_loaders",
     "seed_everything",
+    # E10-A local codebook repair.
+    "CodebookRepairConfig",
+    "LocalCodebookRepairAdapter",
+    "calibrate_repair_thresholds",
+    "quantize_with_codebook_view",
     "TentAdapter",
     "EATALiteAdapter",
     "NoUpdateAdapter",

@@ -78,6 +78,20 @@ RETRIEVAL_DIAG_KEYS = [
 ]
 
 
+# E10-A local codebook repair diagnostics.
+REPAIR_DIAG_KEYS = [
+    "repair_hard_usage",
+    "repair_dead_code_fraction",
+    "repair_hard_perplexity",
+    "repair_codebook_drift",
+    "repair_code_churn",
+    "repair_update_rate",
+    "repair_reseed_rate",
+    "repair_dq_delta",
+    "repair_reliability",
+]
+
+
 def _trapezoid(y, x=None, dx=1.0, axis=-1):
     integrate = getattr(np, "trapezoid", None)
     if integrate is None:
@@ -289,6 +303,24 @@ def _retrieval_batch_diagnostics(dbg: dict, y: torch.Tensor, pred: torch.Tensor)
     return out
 
 
+def _repair_batch_diagnostics(dbg: dict, batch_size: int) -> dict | None:
+    """Extract local codebook-repair diagnostics from ``dbg``."""
+    if "repair_hard_usage" not in dbg:
+        return None
+    device = dbg["z"].device
+    out: dict = {}
+    for key in REPAIR_DIAG_KEYS:
+        value = dbg.get(key)
+        if value is None:
+            out[key] = torch.zeros(batch_size, device=device)
+            continue
+        tensor = value.detach()
+        if tensor.dim() == 0:
+            tensor = tensor.expand(batch_size).clone()
+        out[key] = tensor.to(device)
+    return out
+
+
 def _add_global_hard_counts(counts: torch.Tensor | None, dbg: dict) -> torch.Tensor | None:
     indices = dbg.get("encoding_indices")
     num_embeddings = int(dbg.get("num_embeddings", 0) or 0)
@@ -473,6 +505,8 @@ def evaluate_dememte_tta(
     has_memory_diag = False
     retrieval_diag_values = {k: [] for k in RETRIEVAL_DIAG_KEYS}
     has_retrieval_diag = False
+    repair_diag_values = {k: [] for k in REPAIR_DIAG_KEYS}
+    has_repair_diag = False
     hard_counts = None
     teacher_hard_counts = None
     conf_all, corr_all, nll_all, brier_all = [], [], [], []
@@ -508,6 +542,9 @@ def evaluate_dememte_tta(
         retrieval_diagnostics = _retrieval_batch_diagnostics(dbg, y, pred)
         if retrieval_diagnostics is not None:
             has_retrieval_diag = True
+        repair_diagnostics = _repair_batch_diagnostics(dbg, y.size(0))
+        if repair_diagnostics is not None:
+            has_repair_diag = True
 
         total += y.size(0)
         correct += ok.sum().item()
@@ -526,6 +563,9 @@ def evaluate_dememte_tta(
         if retrieval_diagnostics is not None:
             for key in RETRIEVAL_DIAG_KEYS:
                 retrieval_diag_values[key].append(retrieval_diagnostics[key].detach().cpu())
+        if repair_diagnostics is not None:
+            for key in REPAIR_DIAG_KEYS:
+                repair_diag_values[key].append(repair_diagnostics[key].detach().cpu())
 
         if return_predictions:
             for j in range(y.size(0)):
@@ -558,6 +598,9 @@ def evaluate_dememte_tta(
                             row[key] = int(dbg[key][j].item())
                     if "alpha_eff" in dbg:
                         row["alpha_eff"] = float(dbg["alpha_eff"][j].item())
+                if repair_diagnostics is not None:
+                    for key in REPAIR_DIAG_KEYS:
+                        row[key] = float(repair_diagnostics[key][j].item())
                 prediction_rows.append(row)
             sample_offset += y.size(0)
 
@@ -590,6 +633,9 @@ def evaluate_dememte_tta(
             result.update(_signal_summary(values, key))
     if has_retrieval_diag:
         for key, values in retrieval_diag_values.items():
+            result.update(_signal_summary(values, key))
+    if has_repair_diag:
+        for key, values in repair_diag_values.items():
             result.update(_signal_summary(values, key))
     if return_predictions:
         result["predictions"] = prediction_rows
@@ -676,6 +722,12 @@ def evaluate_dememte_tta_suite(
             )
     if f"{RETRIEVAL_DIAG_KEYS[0]}_mean" in clean:
         for key in RETRIEVAL_DIAG_KEYS:
+            metrics[f"{key}_clean"] = clean[f"{key}_mean"]
+            metrics[f"{key}_corrupt_avg"] = float(
+                np.mean([r.get(f"{key}_mean", 0.0) for r in all_corrupt])
+            )
+    if f"{REPAIR_DIAG_KEYS[0]}_mean" in clean:
+        for key in REPAIR_DIAG_KEYS:
             metrics[f"{key}_clean"] = clean[f"{key}_mean"]
             metrics[f"{key}_corrupt_avg"] = float(
                 np.mean([r.get(f"{key}_mean", 0.0) for r in all_corrupt])
