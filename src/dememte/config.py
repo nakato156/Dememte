@@ -9,13 +9,17 @@ from typing import Optional
 
 @dataclass
 class BaselineConfig:
-    """ResNet18 baseline (frozen or finetuned)."""
+    """ImageNet baseline (frozen or finetuned)."""
 
-    data_dir: str = "../../experiments/data"
-    num_classes: int = 102
+    dataset: str = "imagenet_c"
+    data_dir: str = "../../experiments/data/imagenet-c-subset"
+    num_classes: int = 1000
     batch_size: int = 16
     num_workers: int = 2
     device: str = "cuda"
+    backbone_name: str = "resnet50"
+    backbone_pretrained: bool = True
+    backbone_out_channels: int = 2048
 
     val_ratio: float = 0.2
     split_seed: int = 42
@@ -45,11 +49,15 @@ class BaselineConfig:
 class E5Config:
     """Strict DeMemte VQSA configuration."""
 
-    data_dir: str = "../../experiments/data"
-    num_classes: int = 102
+    dataset: str = "imagenet_c"
+    data_dir: str = "../../experiments/data/imagenet-c-subset"
+    num_classes: int = 1000
     batch_size: int = 16
     num_workers: int = 2
     device: str = "cuda"
+    backbone_name: str = "resnet50"
+    backbone_pretrained: bool = True
+    backbone_out_channels: int = 2048
 
     val_ratio: float = 0.2
     split_seed: int = 42
@@ -109,6 +117,17 @@ class AblationConfig(E5Config):
 
     variant_name: str = "vqsa_full"
     variant_label: str = "VQSA full"
+
+
+@dataclass
+class FlowersLegacyConfig(E5Config):
+    """Legacy Flowers-102 settings kept for reproducing pre-ImageNet runs."""
+
+    dataset: str = "flowers102"
+    data_dir: str = "../../experiments/data"
+    num_classes: int = 102
+    backbone_name: str = "resnet18"
+    backbone_out_channels: int = 512
 
 
 # -- Ablation registry --------------------------------------------------------
@@ -221,9 +240,13 @@ def e6_config(variant_name: str, base: Optional[E5Config] = None) -> E6Config:
 
 
 def resolve_data_dir(config) -> str:
-    """Find the Flowers102 root, accepting common relative paths from notebooks."""
+    """Resolve the configured dataset root, preferring ImageNet-C by default."""
+    dataset = getattr(config, "dataset", "imagenet_c")
     candidates = [
         config.data_dir,
+        "../../experiments/data/imagenet-c-subset",
+        "../experiments/data/imagenet-c-subset",
+        "experiments/data/imagenet-c-subset",
         "../../experiments/data",
         "../experiments/data",
         "experiments/data",
@@ -231,6 +254,10 @@ def resolve_data_dir(config) -> str:
     ]
     for c in candidates:
         p = Path(c).expanduser().resolve()
-        if (p / "flowers-102").exists() or p.name == "flowers-102":
+        if dataset == "flowers102" and ((p / "flowers-102").exists() or p.name == "flowers-102"):
+            return str(p)
+        if dataset == "imagenet_c" and (
+            p.name == "imagenet-c-subset" or any((p / corr).exists() for corr in ("gaussian_noise", "motion_blur", "pixelate", "jpeg_compression"))
+        ):
             return str(p)
     return str(Path(candidates[0]).expanduser().resolve())

@@ -1,7 +1,17 @@
 """DeMemte: strict VQSA models, baselines, data, and experiment helpers."""
 
-from .config import BaselineConfig, E5Config, E6Config, AblationConfig
-from .data import build_loaders, seed_everything
+from .config import AblationConfig, BaselineConfig, E5Config, E6Config, FlowersLegacyConfig
+from .data import (
+    ImageNetCDataset,
+    ImageNetFolderDataset,
+    build_flowers_loaders,
+    build_imagenet_loaders,
+    build_imagenet_c_loader,
+    build_imagenet_c_loaders,
+    build_loaders,
+    load_imagenet_class_index,
+    seed_everything,
+)
 from .codebook_repair import (
     CodebookRepairConfig,
     LocalCodebookRepairAdapter,
@@ -50,7 +60,15 @@ __all__ = [
     "E5Config",
     "E6Config",
     "AblationConfig",
+    "FlowersLegacyConfig",
     "build_loaders",
+    "build_flowers_loaders",
+    "ImageNetCDataset",
+    "ImageNetFolderDataset",
+    "build_imagenet_loaders",
+    "build_imagenet_c_loader",
+    "build_imagenet_c_loaders",
+    "load_imagenet_class_index",
     "seed_everything",
     # E10-A local codebook repair.
     "CodebookRepairConfig",

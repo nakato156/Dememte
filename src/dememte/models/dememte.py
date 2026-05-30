@@ -8,7 +8,7 @@ from typing import List, Tuple
 import torch
 import torch.nn as nn
 
-from .baseline import make_backbone
+from .baseline import backbone_out_channels, make_backbone
 from .vq import LatentProjector, VectorQuantizer2D, make_quantizer2d
 
 
@@ -169,7 +169,8 @@ class DeMemteVQSA(nn.Module):
     def __init__(
         self,
         backbone: nn.Module,
-        num_classes: int = 102,
+        num_classes: int = 1000,
+        backbone_out_channels: int = 512,
         latent_dim: int = 256,
         num_embeddings: int = 1024,
         commitment_cost: float = 0.25,
@@ -189,7 +190,7 @@ class DeMemteVQSA(nn.Module):
         super().__init__()
         self.backbone = backbone
         self.vqsa = VQSAFusion(
-            in_channels=512,
+            in_channels=backbone_out_channels,
             latent_dim=latent_dim,
             num_embeddings=num_embeddings,
             commitment_cost=commitment_cost,
@@ -242,9 +243,11 @@ class DeMemteVQSA(nn.Module):
 
 def make_dememte_variant(config, device: str = "cuda") -> DeMemteVQSA:
     """Build the strict VQSA DeMemte variant from an E5/Ablation config."""
+    backbone_name = getattr(config, "backbone_name", "resnet50")
     model = DeMemteVQSA(
-        backbone=make_backbone(),
+        backbone=make_backbone(backbone_name, pretrained=bool(getattr(config, "backbone_pretrained", True))),
         num_classes=config.num_classes,
+        backbone_out_channels=int(getattr(config, "backbone_out_channels", backbone_out_channels(backbone_name))),
         latent_dim=config.latent_dim,
         num_embeddings=config.num_embeddings,
         commitment_cost=config.commitment_cost,
