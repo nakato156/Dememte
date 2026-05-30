@@ -65,6 +65,19 @@ MEMORY_DIAG_KEYS = [
 ]
 
 
+# E11 retrieval-logit memory diagnostics. These are populated only when an
+# adapter publishes retrieval keys into the debug dict (RetrievalLogitAdapter).
+RETRIEVAL_DIAG_KEYS = [
+    "retrieval_alpha",
+    "retrieval_margin",
+    "retrieval_entropy",
+    "retrieval_agreement",
+    "flip_rate",
+    "corrected_by_retrieval",
+    "broken_by_retrieval",
+]
+
+
 def _trapezoid(y, x=None, dx=1.0, axis=-1):
     integrate = getattr(np, "trapezoid", None)
     if integrate is None:
@@ -239,6 +252,40 @@ def _memory_batch_diagnostics(dbg: dict, batch_size: int) -> dict | None:
         if tensor.dim() == 0:
             tensor = tensor.expand(batch_size).clone()
         out[key] = tensor.to(device)
+    return out
+
+
+def _retrieval_batch_diagnostics(dbg: dict, y: torch.Tensor, pred: torch.Tensor) -> dict | None:
+    """Extract retrieval diagnostics and target-aware flip accounting."""
+    if "retrieval_alpha" not in dbg:
+        return None
+    device = y.device
+    batch_size = y.size(0)
+    out: dict = {}
+    for key in ("retrieval_alpha", "retrieval_margin", "retrieval_entropy", "retrieval_agreement"):
+        value = dbg.get(key)
+        if value is None:
+            out[key] = torch.zeros(batch_size, device=device)
+            continue
+        tensor = value.detach()
+        if tensor.dim() == 0:
+            tensor = tensor.expand(batch_size).clone()
+        out[key] = tensor.to(device)
+
+    base_pred = dbg.get("base_pred")
+    if base_pred is None:
+        out["flip_rate"] = torch.zeros(batch_size, device=device)
+        out["corrected_by_retrieval"] = torch.zeros(batch_size, device=device)
+        out["broken_by_retrieval"] = torch.zeros(batch_size, device=device)
+        return out
+    base_pred = base_pred.detach().to(device)
+    final_pred = pred.detach().to(device)
+    base_ok = base_pred == y
+    final_ok = final_pred == y
+    flipped = base_pred != final_pred
+    out["flip_rate"] = flipped.float()
+    out["corrected_by_retrieval"] = ((~base_ok) & final_ok).float()
+    out["broken_by_retrieval"] = (base_ok & (~final_ok)).float()
     return out
 
 
@@ -424,6 +471,8 @@ def evaluate_dememte_tta(
     teacher_diag_values = {k: [] for k in TEACHER_DIAG_KEYS}
     memory_diag_values = {k: [] for k in MEMORY_DIAG_KEYS}
     has_memory_diag = False
+    retrieval_diag_values = {k: [] for k in RETRIEVAL_DIAG_KEYS}
+    has_retrieval_diag = False
     hard_counts = None
     teacher_hard_counts = None
     conf_all, corr_all, nll_all, brier_all = [], [], [], []
@@ -456,6 +505,9 @@ def evaluate_dememte_tta(
         memory_diagnostics = _memory_batch_diagnostics(dbg, y.size(0))
         if memory_diagnostics is not None:
             has_memory_diag = True
+        retrieval_diagnostics = _retrieval_batch_diagnostics(dbg, y, pred)
+        if retrieval_diagnostics is not None:
+            has_retrieval_diag = True
 
         total += y.size(0)
         correct += ok.sum().item()
@@ -471,6 +523,9 @@ def evaluate_dememte_tta(
         if memory_diagnostics is not None:
             for key in MEMORY_DIAG_KEYS:
                 memory_diag_values[key].append(memory_diagnostics[key].detach().cpu())
+        if retrieval_diagnostics is not None:
+            for key in RETRIEVAL_DIAG_KEYS:
+                retrieval_diag_values[key].append(retrieval_diagnostics[key].detach().cpu())
 
         if return_predictions:
             for j in range(y.size(0)):
@@ -495,6 +550,14 @@ def evaluate_dememte_tta(
                 if memory_diagnostics is not None:
                     for key in MEMORY_DIAG_KEYS:
                         row[key] = float(memory_diagnostics[key][j].item())
+                if retrieval_diagnostics is not None:
+                    for key in RETRIEVAL_DIAG_KEYS:
+                        row[key] = float(retrieval_diagnostics[key][j].item())
+                    for key in ("base_pred", "cache_pred", "final_pred"):
+                        if key in dbg:
+                            row[key] = int(dbg[key][j].item())
+                    if "alpha_eff" in dbg:
+                        row["alpha_eff"] = float(dbg["alpha_eff"][j].item())
                 prediction_rows.append(row)
             sample_offset += y.size(0)
 
@@ -524,6 +587,9 @@ def evaluate_dememte_tta(
         result["teacher_dead_code_fraction_mean"] = teacher_global["dead_code_fraction_mean"]
     if has_memory_diag:
         for key, values in memory_diag_values.items():
+            result.update(_signal_summary(values, key))
+    if has_retrieval_diag:
+        for key, values in retrieval_diag_values.items():
             result.update(_signal_summary(values, key))
     if return_predictions:
         result["predictions"] = prediction_rows
@@ -604,6 +670,12 @@ def evaluate_dememte_tta_suite(
     # has_memory_diag was true for that call).
     if f"{MEMORY_DIAG_KEYS[0]}_mean" in clean:
         for key in MEMORY_DIAG_KEYS:
+            metrics[f"{key}_clean"] = clean[f"{key}_mean"]
+            metrics[f"{key}_corrupt_avg"] = float(
+                np.mean([r.get(f"{key}_mean", 0.0) for r in all_corrupt])
+            )
+    if f"{RETRIEVAL_DIAG_KEYS[0]}_mean" in clean:
+        for key in RETRIEVAL_DIAG_KEYS:
             metrics[f"{key}_clean"] = clean[f"{key}_mean"]
             metrics[f"{key}_corrupt_avg"] = float(
                 np.mean([r.get(f"{key}_mean", 0.0) for r in all_corrupt])

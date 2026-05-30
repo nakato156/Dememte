@@ -11,6 +11,13 @@ from .memory import (
     familiarity_gate,
     pattern_completion,
 )
+from .retrieval import (
+    RetrievalCache,
+    RetrievalConfig,
+    RetrievalLogitAdapter,
+    build_labeled_cache,
+    extract_retrieval_key,
+)
 from .tta import (
     AlphaBNStatsAdapter,
     CodebookLossAdapter,
@@ -65,4 +72,10 @@ __all__ = [
     "familiarity_gate",
     "pattern_completion",
     "effective_codebook",
+    # E11 retrieval-logit memory.
+    "RetrievalConfig",
+    "RetrievalCache",
+    "RetrievalLogitAdapter",
+    "build_labeled_cache",
+    "extract_retrieval_key",
 ]
