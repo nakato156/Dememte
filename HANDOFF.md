@@ -15,14 +15,21 @@ La linea activa del repo ya no usa attractor/gate. Los experimentos relevantes s
 - `notebooks/07_e7_tta/`: primer intento de Test-Time Adaptation (E7 v1 — colapso).
 - `notebooks/08_e7b_tta/`: TTA conservador con LayerNorm + preservacion de memoria
   latente (E7b — resultado negativo util, ejecutado).
-- (pendiente) `notebooks/09_e7c_codebook/`: plasticidad del codebook (E7c — siguiente
-  paso, ver roadmap abajo).
+- `notebooks/09_e7c_codebook/`: plasticidad del codebook (E7c-A — ejecutado; primer
+  dato real de Q5, ver abajo).
+- `notebooks/10_memory_hippocampal/`: memoria asociativa biologica TTA-only
+  (E10 — ejecutado; Hopfield + pattern completion + buffer episodico).
 
-El checkpoint base usado para E7/E7b/E7c es:
+El checkpoint base usado para E7/E7b/E7c es
+`notebooks/06_e6_zq_alignment/out/e6_ema_kmeans_restart/best.pt`. E7c-A usa ademas
+la base SimVQ `e6_simvq_linear/best.pt` (codebook adaptable). E10 corre sobre ambas.
 
-```text
-notebooks/06_e6_zq_alignment/out/e6_ema_kmeans_restart/best.pt
-```
+**Patron consolidado tras E7→E7c→E10**: cada mecanismo de "memoria" se activa
+mecanicamente (drift > 0, completion > 0, buffer escribe) pero **es numericamente
+inerte en accuracy** bajo hiperparametros conservadores. La tesis Q5 esta
+mecanisticamente viva y nunca numericamente demostrada. El siguiente paso ya **no**
+es un cuarto mecanismo, sino atacar la causa de la inercia (ver "Donde nos quedamos"
+y el roadmap guiado por literatura abajo).
 
 ## Que se ha intentado
 
@@ -155,101 +162,134 @@ Detalle completo con citas verificadas leyendo los papers en
    no porque el regularizador haya hecho algo. **La tesis Q5 no se pudo testear con
    esta superficie de adaptacion**.
 
+## E7c-A: plasticidad del codebook (ejecutado)
+
+Detalle con citas en `notebooks/09_e7c_codebook/insights.md`. Base SimVQ
+(`e6_simvq_linear`, codebook adaptable via `codebook_transform.weight`). Suite test
+6149 imagenes, `lr=2.5e-4`, 1 step/batch, SGD momentum=0.9, `MEM_WEIGHTS=(1,1,1)`.
+
+| variante | clean | corrupt | ECE | zq_drift | churn | nota |
+|---|---:|---:|---:|---:|---:|---|
+| `source` | 0.7317 | 0.4807 | 0.062 | — | — | — |
+| `tent_codebook_softassign` | 0.7317 | 0.4808 | 0.062 | **0.0036** | 0.0021 | drift>0: codebook mojable |
+| `tent_codebook_memreg` | 0.7317 | 0.4807 | 0.062 | **0.0000** | 0.0000 | memoria domina (drift exacto 0) |
+| `eata_codebook_srcfilter_memreg` | 0.7317 | 0.4807 | 0.062 | 0.0000 | 0.0000 | idem |
+| `codebook_loss_adapt` | 0.7318 | 0.4807 | 0.062 | 0.0005 | 0.0002 | ruta `codebook_loss` tambien muerde |
+| `ttn_alpha_bn_095` | 0.7087 | 0.4622 | 0.073 | — | — | α-BN al 5% degrada (−2.3pp clean) |
+| `bn_stats_no_update` | 0.0299 | 0.0257 | 0.407 | — | — | baseline colapso (reportado) |
+
+Hitos: (1) **muro estructural de E7b superado** — el codebook SI es alcanzable cuando
+la perdida toca rutas vivas (`soft_assign`/`codebook_loss`), no el straight-through
+`q_st = z + (q-z).detach()`. `tent_codebook` puro queda excluido por inerte estructural
+(test de regresion `test_tent_codebook_pure_is_structurally_inert`). (2) **Primer dato
+cuantitativo de Q5**: el regularizador de memoria pina el drift a 0.0000 exacto — la
+memoria es preservable bajo TTA. (3) **Pero accuracy inerte**: ±0.001 de source. Q5
+operacionalmente viva, no numericamente demostrada.
+
+## E10: memoria asociativa biologica TTA-only (ejecutado)
+
+Detalle formal en `notebooks/10_memory_hippocampal/insights.md`. Tres mecanismos
+sobre los checkpoints E6 sin reentrenar: recuperacion asociativa del codebook
+(Hopfield moderno), pattern completion iterativa con gate de familiaridad, y doble via
+codebook semantico + buffer episodico EMA. Integracion = **mezcla suave en `zq_pool`
+con `λ_max ≤ 0.1`** (filosofia α-mix de TTN trasladada al espacio de tokens).
+
+Phase 0 (gates duros, `out/e10_phase0.json`): familiaridad viable en ambas bases;
+SimVQ restringido a `episodic_only` por `hard_usage=0.011 < 0.1` (codebook colapsado →
+recuperacion semantica sin sentido); ambas pasan floor de clean acc.
+
+Resultados base `e6_ema_kmeans_restart` (source clean 0.7523 / corrupt 0.5030):
+
+| variante | clean | corrupt | Δcorrupt | nota |
+|---|---:|---:|---:|---|
+| `episodic_only` ★ | 0.7557 | **0.5051** | +0.0021 | unica net-positiva (dentro de ruido) |
+| `consolidation_slow` | 0.7512 | 0.5035 | +0.0005 | |
+| `hippocampal_full` | 0.7518 | 0.5031 | +0.0001 | |
+| `assoc_recall_*` (const/fam/unfam) | ~0.750 | ~0.502 | −0.0004…−0.0009 | recall semantico regresiona |
+| `completion_T3_best_gate` | 0.7504 | 0.5023 | −0.0006 | |
+
+Insights clave: (1) **hitos mecanicos OK** (`completion_amount_corrupt`>0,
+`episodic_buffer_churn`>0, trayectoria convergente) pero deltas en ±0.003 clean /
+±0.002 corrupt → ruido. (2) **Aislamiento**: `assoc_recall_const` (solo softear el
+argmin VQ, sin gate biologico) es la PEOR; añadir familiaridad/unfamiliaridad/T=3 no
+mejora → el gate biologico no aporta sobre el soft-recall, y `λ_max=0.1` lo recorta.
+(3) **Solo la via episodica ayuda** (marginalmente); el recall semantico perjudica.
+(4) SimVQ episodico plano: la recuperacion asociativa exige codebook sano (refuerza el
+headline E6).
+
 ## Donde nos quedamos
 
-E7b cierra limpio como **resultado negativo util**:
+El patron es consistente a traves de E7b, E7c-A y E10: **el mecanismo se activa pero
+no mueve accuracy**. Diagnostico de la causa (no del sintoma):
 
-- TTA conservador (LayerNorm) es seguro pero inerte sobre este checkpoint.
-- El regularizador de memoria esta estructuralmente desactivado: la memoria
-  (codebook) vive aguas arriba de la unica superficie batch-agnostica del modelo.
-- Para testear la tesis Q5 (pattern completion como plasticidad) hay que mover la
-  superficie de adaptacion a un punto que **influya sobre `z`/`zq`**, que es
-  justamente lo congelado/dependiente de BN.
+- El clasificador esta **congelado y downstream**; las perturbaciones pequeñas en
+  `zq`/codebook se lavan antes del logit.
+- Cada eleccion conservadora (LayerNorm inerte, `λ_max≤0.1`, memreg que pina drift a 0)
+  **garantiza** la inercia para proteger calibracion. El proyecto elige conservador y
+  luego se sorprende de no ver señal.
+- La unica via con signo positivo (episodico en E10) sugiere **memoria no-parametrica /
+  retrieval** antes que adaptacion parametrica diminuta.
+
+Por eso el siguiente paso es una **busqueda de literatura dirigida** (usuario la hace
+en NotebookLM, base de 48 papers) antes de implementar. Direcciones priorizadas en el
+roadmap abajo.
 
 Tests actuales:
 
 ```bash
 PYTHONPATH=src ./.venv/bin/python -m pytest
-# 23 passed (17 originales + 6 nuevos de E7b)
+# E7b: 23 passed; E7c añade tests de plasticidad/inercia estructural del codebook
 ```
 
-## Roadmap E7c (siguiente experimento)
+## Roadmap (guiado por literatura — busqueda en curso por el usuario)
 
-### E7c-A (principal): plasticidad del codebook
+El usuario tiene una base de 48 papers en NotebookLM y va a extraer conocimiento con
+preguntas dirigidas. Las direcciones, ordenadas por palanca real sobre la inercia:
 
-Adaptar `model.vq.embedding.weight` (vq/ema_vq) o `model.vq.codebook_base`
-(simvq_linear) en test-time, con `latent_memory_loss` como ancla anti-deriva. Es la
-primera superficie aguas arriba que mueve `z`/`zq` sin tocar BN. El codebook como
-parametro adaptable es la operacionalizacion directa de Q5 (plasticidad sinaptica).
-FSQ queda fuera (codebook lookup-free).
+### Prioridad 1 — Memoria no-parametrica / retrieval (el pivote)
+La via episodica de E10 fue la unica net-positiva → convertir el "claim de memoria" en
+un mecanismo de **retrieval que cambie la prediccion** (re-ranking del logit / cache
+model tipo Tip-Adapter / kNN en test-time), no un soft-mix de `λ=0.1`. Ataca la causa:
+hoy el efecto se lava antes del clasificador congelado. Riesgo de ingenieria medio,
+maxima probabilidad de romper el patron de inercia.
 
-Cambios incrementales sobre E7b:
+### Prioridad 2 — Superficie de adaptacion que propague al logit
+E7b mostro LN inerte (downstream de z/zq); E7c-A movio el codebook pero el efecto no
+llega al logit congelado. Buscar superficies *upstream* con gradiente demostrable a la
+salida (test-time prompt tuning, modulacion de features, test-time training con
+auto-supervision). Formaliza la leccion "gradiente estructuralmente nulo".
 
-- `configure_tta_codebook(model)` + `collect_tta_codebook_params(model)` en
-  `src/dememte/tta.py`.
-- Reusar `MemoryTentAdapter` y `SourceFilterEATAAdapter` tal cual: ahora **si muerden**
-  porque `latent_memory_loss` tiene gradiente respecto al codebook (via `zq` y
-  `soft_assign`).
-- Notebook hermano `notebooks/09_e7c_codebook/e7c_codebook.ipynb` reusando el suite
-  y los baselines `source`/`bn_stats_no_update`.
+### Prioridad 3 — λ derivado por muestra (experimento barato e inmediato)
+Phase 0 de E10 muestra que la familiaridad SI discrimina (`g`: 0.50 clean → 0.39 bajo
+corrupcion). Reemplazar el `λ_max=0.1` fijo por un λ **derivado por muestra** de esa
+señal, midiendo explicitamente el trade-off ECE/NLL (calibracion bajo shift). Cambio
+pequeño sobre el `HippocampalConfig` de E10.
 
-Variantes: `tent_codebook`, `eata_codebook`, `eata_codebook_srcfilter`,
-`tent_codebook_memreg`, `eata_codebook_srcfilter_memreg`.
+### Prioridad 4 — Purificacion / proyeccion a manifold limpio
+Replantear el codebook como *prior de manifold limpio* y **proyectar/denoise** la
+feature corrupta (mas agresivo que mix 0.1), en vez de mezclar. Conecta directo con el
+claim de "pattern completion". Mayor riesgo conceptual.
 
-**Hito minimo de exito (antes de medir accuracy)**:
+### Transversal — blindar el resultado negativo y verificar headroom
+Si el patron sigue inerte, convertirlo en negative result bien diagnosticado
+(failure modes de TTA, evaluacion rigurosa). Y verificar que Flowers-102 + la suite de
+corrupcion no este **saturada** para el regimen frozen-backbone (regimen de shift mas
+severo / gradual / online correlacionado donde exista margen medible).
 
-- `tent_codebook` colapsa el codebook (cae `hard_usage`, sube `dead_code_fraction`)
-  → demuestra que el codebook es mojable desde TTA.
-- `tent_codebook_memreg` mantiene el codebook cerca de source → demuestra que el
-  regularizador finalmente muerde. Primer dato real sobre Q5.
-
-Foco en `gaussian_noise` y `pixel_mask` (las dos corrupciones donde source rinde
-peor, ~0.35): es ahi donde `z` deriva mas y donde la plasticidad podria ayudar.
-
-### E7c-D (baseline barato, en paralelo): calibracion de stats del projector BN
-
-Hook sobre `projector.net.1` (BatchNorm del projector) que reemplaza el forward por
-`μ = α·running + (1−α)·batch`, `σ² = α·running + (1−α)·batch`, con α pequeño
-(0.05–0.2). Sin gradiente. Familia [TTN (Lim et al., ICLR
-2023)](https://arxiv.org/abs/2302.05155) / α-BN. Sirve para distinguir "ganancia por
-mezclar stats" de "ganancia por plasticidad de codebook".
-
-### E7c-B (escalar si A y D dan senal): adaptar conv 1x1 del projector
-
-`projector.net.0` es `Conv2d(512, latent_dim, kernel_size=1)` (~131k params).
-Adaptar sus pesos manteniendo `projector.net.1` (BN) congelada en running stats.
-Combinar con `latent_memory_loss` como ancla.
-
-### E7c-Z (plan B, solo si A/B/D no rinden): FOA caja negra
-
-[FOA (Niu et al., ICML 2024)](https://arxiv.org/abs/2404.01650): prompt aditivo en
-la entrada via CMA-ES, red entera congelada, sin retropropagacion. Elimina por
-completo el problema de BN. Coste de implementacion mayor.
-
-### Diagnosticos a instrumentar (deuda tecnica de E7b)
-
-E7b no distingue "memoria preservada porque funciona" de "memoria preservada porque
-es inalcanzable". Añadir columnas a `evaluate_dememte_tta` (todas baratas, ya hay
-debug del teacher disponible):
-
-- `z_drift` = `‖z − z_src‖`, `zq_drift` = `‖zq − zq_src‖`.
-- `assignment_churn` = `mean(encoding_indices ≠ encoding_indices_src)`.
-- `kl_assign_src` = `KL(soft_assign_src ‖ soft_assign)` registrado (no solo en la
-  loss).
-
-### Ablacion metodologica nueva: consolidacion vs episodico
-
-`evaluate_dememte_tta_suite` resetea el adapter por cada `(corrupcion, severidad)`
-(`adapter_factory()` fresco). Para la analogia de consolidacion neocortical de Q5
-tiene sentido una ablacion **continual**: un solo stream que mezcla corrupciones,
-sin reset, donde el codebook acumula. Cambio de 2 lineas en el suite. Vale en E7c-A.
+### Deuda concreta pendiente
+- Las preguntas para NotebookLM (10 principales) estan diseñadas; si se quiere, anclar
+  respuesta↔direccion en un `literature_questions.md`.
 
 ## Lo que NO vale la pena (cerrar puertas)
 
-- Mas variantes LN-only o sweeps de `lr`/`d_margin`: el techo ya esta confirmado.
-- Reemplazo *post-hoc* de BN por GN/LN en el checkpoint: RESPONSES Q3 lo descarta
-  explicitamente; SAR usa modelos pre-entrenados nativamente con GN/LN.
-- Sweeps sobre `bn_stats_no_update`: es baseline reportado, no se va a salvar.
+- Mas variantes LN-only o sweeps de `lr`/`d_margin`: el techo ya esta confirmado (E7b).
+- Mas mecanismos de memoria "biologica" en soft-mix con `λ` pequeño: E10 cierra que el
+  gate biologico no aporta sobre softear el argmin, y `λ≤0.1` garantiza inercia.
+- Reemplazo *post-hoc* de BN por GN/LN en el checkpoint: RESPONSES Q3 lo descarta;
+  SAR usa modelos pre-entrenados nativamente con GN/LN.
+- α-BN sobre el projector (E7c-D `ttn_alpha_bn_*`): degrada incluso al 5%; el projector
+  BN esta perfectamente calibrado al source y no tolera mezcla. Cerrado.
+- Sweeps sobre `bn_stats_no_update`: baseline de colapso reportado, no se salva.
 
 ## Preguntas abiertas (RESPONSES.md, vigentes)
 
@@ -280,6 +320,10 @@ sin reset, donde el codebook acumula. Cambio de 2 lineas en el suite. Vale en E7
 - `notebooks/06_e6_zq_alignment/out/e6_results.csv`: resultados E6.
 - `notebooks/07_e7_tta/out/e7_results.csv`: resultados E7 v1 (colapso).
 - `notebooks/08_e7b_tta/out/e7b_results.csv`: resultados E7b.
+- `notebooks/09_e7c_codebook/out/e7c_results.csv` + `insights.md`: resultados E7c-A
+  (plasticidad del codebook, primer dato Q5).
+- `notebooks/10_memory_hippocampal/out/{e10_results.csv,e10_phase0.json,e10_summary.md}`
+  + `insights.md`: resultados E10 (memoria asociativa biologica TTA-only).
 - `notebooks/08_e7b_tta/insights.md`: analisis E7b con bibliografia verificada
   (TENT, EATA, SAR, CoTTA, EcoTTA, SoTTA, FOA, Schneider, TTN, Hybrid-TTA,
   VQ-VAE, VQ-VAE-2, Jukebox, SimVQ, FSQ, Hendrycks, Flowers-102, etc.).
@@ -288,18 +332,14 @@ sin reset, donde el codebook acumula. Cambio de 2 lineas en el suite. Vale en E7
 
 ## Siguiente paso sugerido
 
-Implementar **E7c-A (plasticidad del codebook)**:
+1. **Esperar la busqueda de literatura** (NotebookLM, 48 papers) sobre las 4
+   direcciones priorizadas; la apuesta principal es **retrieval no-parametrico**
+   (Prioridad 1) porque ataca la causa de la inercia, no el sintoma.
+2. **Experimento barato mientras tanto**: λ derivado por muestra (Prioridad 3) sobre
+   el `HippocampalConfig` de E10 — usa la señal de familiaridad que Phase 0 ya valido,
+   reportando el trade-off ECE/NLL.
 
-1. Anadir `configure_tta_codebook` y `collect_tta_codebook_params` en `tta.py`.
-2. Instrumentar los diagnosticos de deriva (`z_drift`, `assignment_churn`, etc.)
-   en `evaluate_dememte_tta`.
-3. Hand-write `notebooks/09_e7c_codebook/e7c_codebook.ipynb` espejando el de E7b.
-4. Tests CPU mirroring los de E7b.
-
-Criterio de exito del primer cut **no es accuracy** sino:
-
-- `tent_codebook` colapsa el codebook (hard_usage baja) → la superficie es mojable.
-- `tent_codebook_memreg` lo preserva cerca de source → el regularizador muerde.
-
-Es el primer experimento donde la tesis de DeMemte (memoria como plasticidad
-con preservacion) es realmente testeable.
+El criterio de exito sigue **sin ser accuracy a secas**: romper el patron significa
+mostrar un mecanismo cuyo efecto **llega al logit** con coste de calibracion acotado.
+Hasta ahora E7c y E10 prueban que la memoria es *preservable/activable* pero no que
+*mueva la prediccion*.
