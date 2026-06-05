@@ -24,7 +24,6 @@ from dememte.tta import (
     configure_tta_model,
     latent_memory_loss,
     make_tta_optimizer,
-    soft_assign_entropy,
 )
 from dememte.training import make_optimizer_vqsa, run_epoch_vqsa
 

@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "Demente",
+  "project_id": "28b35c59-f8c9-4af8-947a-8b1ce35a89c7"
+}

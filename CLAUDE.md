@@ -124,21 +124,22 @@ papers/                         Local PDFs of cited works
 RESPONSES.md                    Methodology Q&A (Q1–Q5) — the reasoning behind E7/E7b/E7c
 NOTES.md, VALIDATIONS.md, HANDOFF.md   Working notes / handoff scratchpads
 inform.tex, inform.pdf          Project report
-CLAUDE.md, README.md, requirements.txt, requirements-scraper.txt, .gitignore
+CLAUDE.md, AGENTS.md, README.md, pyproject.toml, uv.lock, requirements-scraper.txt, .gitignore
 ```
 
 There is no `scripts/build_notebooks.py` in the current tree — edit notebooks directly.
 
 ## Running Code
 
-All execution is notebook-cell-by-cell. CUDA GPU required. Dependencies in `requirements.txt`. Each notebook follows: Config → Data → Model → (train if `RUN_TRAINING=True`, else load checkpoint from its `out/`) → Evaluate clean+corrupt → Persist to `out/`.
+All execution is notebook-cell-by-cell. CUDA GPU required. Dependencies are managed with **uv** (`pyproject.toml` + `uv.lock`); set up the environment with `uv sync --extra dev`. Each notebook follows: Config → Data → Model → (train if `RUN_TRAINING=True`, else load checkpoint from its `out/`) → Evaluate clean+corrupt → Persist to `out/`.
 
 E7 / E7b / E7c notebooks **require** an E6 checkpoint on disk. They read from `notebooks/06_e6_zq_alignment/out/<variant>/best.pt` — train E6 first (or restore those checkpoints) before running TTA notebooks. E7c-A specifically reads the SimVQ variant; the others read `e6_ema_kmeans_restart`.
 
 Run the tests with:
 
 ```bash
-PYTHONPATH=src ./.venv/bin/python -m pytest
+uv run pytest          # uv-managed env (package installed editable from src/)
+# or, against any interpreter: PYTHONPATH=src python -m pytest
 ```
 
 ## Configs and variants
@@ -191,3 +192,51 @@ The codebook is the project's "memory". The TTA experiments are organised around
 - Notebooks read `RUN_TRAINING` from a top cell — flip to `False` to evaluate from existing `out/best.pt` / `out/vqsa_best.pt`.
 - Diagnostics reported by `evaluate_dememte*`: `clean_acc`, `corrupt_acc_avg`, per-corruption accuracy, `ece`, `nll`, `brier`, plus VQSA-specific `vq_loss`, `codebook_loss`, `commitment_loss`, `dq_mean`, `assignment_entropy`, `codebook_perplexity`, `hard_usage`, `hard_perplexity`, `dead_code_fraction`, `attention_entropy`. Gate-era metrics (`gate_mean`, `pareidolia_rate`, prediction-change counts) are gone — don't reintroduce them.
 - TTA evaluators additionally report `tta_updates`, `tta_selection_rate`, and (for E7c) `zq_drift`, `assignment_churn`, `kl_src` against a frozen teacher.
+
+
+<!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
+## Beads Issue Tracker
+
+This project uses **bd (beads)** for issue tracking. Run `bd prime` to see full workflow context and commands.
+
+### Quick Reference
+
+```bash
+bd ready              # Find available work
+bd show <id>          # View issue details
+bd update <id> --claim  # Claim work
+bd close <id>         # Complete work
+```
+
+### Rules
+
+- Use `bd` for ALL task tracking — do NOT use TodoWrite, TaskCreate, or markdown TODO lists
+- Run `bd prime` for detailed command reference and session close protocol
+- Use `bd remember` for persistent knowledge — do NOT use MEMORY.md files
+
+## Session Completion
+
+**When ending a work session**, you MUST complete ALL steps below. Work is NOT complete until `git push` succeeds.
+
+**MANDATORY WORKFLOW:**
+
+1. **File issues for remaining work** - Create issues for anything that needs follow-up
+2. **Run quality gates** (if code changed) - Tests, linters, builds
+3. **Update issue status** - Close finished work, update in-progress items
+4. **PUSH TO REMOTE** - This is MANDATORY:
+   ```bash
+   git pull --rebase
+   bd dolt push
+   git push
+   git status  # MUST show "up to date with origin"
+   ```
+5. **Clean up** - Clear stashes, prune remote branches
+6. **Verify** - All changes committed AND pushed
+7. **Hand off** - Provide context for next session
+
+**CRITICAL RULES:**
+- Work is NOT complete until `git push` succeeds
+- NEVER stop before pushing - that leaves work stranded locally
+- NEVER say "ready to push when you are" - YOU must push
+- If push fails, resolve and retry until it succeeds
+<!-- END BEADS INTEGRATION -->

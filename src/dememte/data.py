@@ -11,7 +11,7 @@ import json
 import random
 import urllib.request
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Sequence, Tuple
+from typing import Dict, Sequence, Tuple
 
 import numpy as np
 import torch

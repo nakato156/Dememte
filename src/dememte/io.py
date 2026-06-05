@@ -6,7 +6,7 @@ import csv
 import json
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 import torch
 
