@@ -1,0 +1,23 @@
+name: CI
+
+# Lint + smoke only: the real test suite (tests/) imports torch and is run
+# locally against a CUDA env. CI stays green and cheap — no torch on the runner.
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lint
+        run: uvx ruff check .
+
+      - name: Smoke test
+        run: uvx pytest -q tests/test_smoke.py

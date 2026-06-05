@@ -1,7 +1,11 @@
 env/
+.venv*/
 data/
 out/
+papers/
+*.pdf
 *.pth
+*.pt
 *.log
 __pycache__/
 *.ipynb_checkpoints
@@ -25,3 +29,11 @@ build/
 *.bak
 *.tmp
 *.swp
+
+Dememte-critica.md
+VALIDATIONS.md
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key

@@ -1,0 +1,43 @@
+[project]
+name = "dememte"
+version = "0.1.0"
+description = "Frozen ResNet18 + VQ-Self-Attention (VQSA) memory for quality-independent image classification on Flowers-102."
+requires-python = ">=3.12"
+dependencies = [
+    "numpy",
+    "pandas",
+    "torch",
+    "torchvision",
+    "huggingface_hub",
+    "pyarrow",
+    "scikit-learn",
+    "matplotlib",
+    "scipy",
+    "jupyter",
+    "nbformat",
+    "tqdm",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.4"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dememte"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# Legacy attractor/gate code and orchestration notebooks are out of the active path.
+extend-exclude = ["archive", "experiments", "notebooks", "*.ipynb"]
+
+[tool.ruff.lint]
+# Research-code idioms we deliberately allow: import placement after setup,
+# single-line statements, lambda assignment, and ambiguous math names (l, I, O).
+ignore = ["E402", "E701", "E702", "E703", "E731", "E741"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
