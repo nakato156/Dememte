@@ -2,12 +2,15 @@
 
 > Fuente única de la narrativa. beads = tracking del trabajo; `insights.md` = detalle por
 > experimento; este archivo = qué afirmamos, con qué evidencia y en qué estado.
-> `inform` (Typst) se DERIVA de aquí, no al revés, y jala números con `#csv()` directo de
-> los CSV. `HANDOFF.md` es scratchpad de sesión, no contrato.
+> El `inform` (hoy `inform.tex` en LaTeX; objetivo: migrar a Typst y jalar números con
+> `#csv()` directo de los CSV) se DERIVA de aquí, no al revés. `HANDOFF.md` es scratchpad
+> de sesión, no contrato.
 >
-> **Regla absoluta: cero números en este archivo.** Ninguna celda lleva un valor, delta,
-> pp ni porcentaje — sólo la ruta al CSV/JSON que lo contiene. Si un número cambia, cambia
-> el CSV; este ledger no se toca. Sin excepciones, sin "ilustrativos".
+> **Regla absoluta: cero números de resultados en este archivo.** Ninguna celda lleva un
+> valor de métrica (accuracy, delta, pp, ECE/NLL, porcentaje) — sólo la ruta al CSV/JSON
+> que lo contiene. Sí están permitidos los que NO son resultados: fechas de cotejo, ids de
+> claim (C1…), nombres de dataset/backbone e hiperparámetros que *definen* un claim (λ≤0.1,
+> sev 1–5). Si un número de resultado cambia, cambia el CSV; este ledger no se toca.
 
 ## Spine (un párrafo)
 
@@ -45,7 +48,7 @@ el `inform`, releer su(s) CSV si la fecha es vieja.
 
 ## Cobertura OOD (qué shift, dónde, estado del experimento)
 
-Sin números — solo rol, eje de shift y estado de ejecución. El slate objetivo del pivote a
+Sin métricas — solo rol, eje de shift y estado de ejecución. El slate objetivo del pivote a
 retrieval es Flowers + ImageNet (C y R) + CIFAR-C.
 
 | dataset / backbone | rol en la tesis | tipo de shift | granularidad | severidad | estado | issue |
