@@ -92,6 +92,7 @@ def test_imagenet_c_loader_and_suite_metadata(tmp_path):
         batch_size=1,
         num_workers=0,
         class_index_path=mapping,
+        pin_memory=False,
     )
     batch_x, batch_y = next(iter(loader))
     assert batch_x.shape[-2:] == (224, 224)
@@ -106,6 +107,7 @@ def test_imagenet_c_loader_and_suite_metadata(tmp_path):
         batch_size=1,
         num_workers=0,
         class_index_path=mapping,
+        pin_memory=False,
     )
     assert ("gaussian_noise", 3) in loaders
     assert ("pixelate", 5) in loaders
@@ -153,6 +155,7 @@ def test_clean_imagenet_loader_uses_canonical_class_indices(tmp_path):
         batch_size=1,
         num_workers=0,
         class_index_path=mapping,
+        pin_memory=False,
     )
     _, y_train = next(iter(train_loader))
     _, y_val = next(iter(val_loader))
