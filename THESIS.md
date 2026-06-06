@@ -48,12 +48,12 @@ el `inform`, releer su(s) CSV si la fecha es vieja.
 Sin números — solo rol, eje de shift y estado de ejecución. El slate objetivo del pivote a
 retrieval es Flowers + ImageNet (C y R) + CIFAR-C.
 
-| dataset / backbone | rol en la tesis | tipo de shift | granularidad | severidad | estado |
-|--------------------|-----------------|---------------|--------------|-----------|--------|
-| Flowers-102 / RN18 | control fino + baselines del trade-off + ablaciones de codebook | sintético (gaussian_noise, pixel_mask, cutout, blur) | fino | grid 3 niveles | baselines hechos; retrieval E11 NO portado aún |
-| ImageNet-C / RN50 | escala | sintético (gaussian_noise, motion_blur, pixelate, jpeg) | medio | sev 3, 5 | E10 + E11 hechos |
-| ImageNet-R o Sketch / RN50 | refutar "solo es denoising de ruido sintético" | **natural / semántico** (renditions/sketch) | medio | n/a | PENDIENTE |
-| CIFAR-10-C / CIFAR-100-C | curva de severidad barata | sintético (15 corrupciones) | grueso / medio | **1–5** | PENDIENTE (se ordena después) |
+| dataset / backbone | rol en la tesis | tipo de shift | granularidad | severidad | estado | issue |
+|--------------------|-----------------|---------------|--------------|-----------|--------|-------|
+| Flowers-102 / RN18 | control fino + baselines del trade-off + ablaciones de codebook | sintético (gaussian_noise, pixel_mask, cutout, blur) | fino | grid 3 niveles | baselines hechos; retrieval E11 NO portado aún | wtq.5 |
+| ImageNet-C / RN50 | escala | sintético (gaussian_noise, motion_blur, pixelate, jpeg) | medio | sev 3, 5 | E10 + E11 hechos | wtq.1 |
+| ImageNet-R o Sketch / RN50 | refutar "solo es denoising de ruido sintético" | **natural / semántico** (renditions/sketch) | medio | n/a | PENDIENTE | wtq.6 |
+| CIFAR-10-C / CIFAR-100-C | curva de severidad barata | sintético (15 corrupciones) | grueso / medio | **1–5** | PENDIENTE (se ordena después) | wtq.7 |
 
 ## Tensiones abiertas (resumen vivo)
 
