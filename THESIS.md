@@ -44,7 +44,7 @@ el `inform`, releer su(s) CSV si la fecha es vieja.
 | C5 | la representación útil para recuperar vecinos es `z_pool` (continuo, pre-cuantización), no `zq_pool` | `sostenido` | `notebooks/11_retrieval_memory/out/e11_results.csv`; `notebooks/11_retrieval_memory/insights.md` (Insight 2) | ImageNet-C | 2026-06-05 | — | — |
 | C6 | el codebook (`zq_pool`) como clave de memoria está aliasado: vota con fuerza pero sin precisión | `negativo-útil` | `notebooks/11_retrieval_memory/out/e11_results.csv` (variante `source_cache_zq_pool_fixed_alpha`) | ImageNet-C | 2026-06-05 | reframe del pivote: zq deja de ser "la memoria" y pasa a ablación negativa que justifica el uso de z_pool. Gate de unfamiliarity lo rescata parcialmente pero queda lejos de z_pool | — |
 | C7 | memoria episódica online con pseudo-labels se contamina (rompe más de lo que repara) | `negativo-útil` | `notebooks/11_retrieval_memory/out/e11_results.csv` (variantes `episodic_cache_zq_pool`, `dual_cache_zq_pool`) | ImageNet-C | 2026-06-05 | lección para el claim biológico: plasticidad episódica sin filtro de verdad = auto-refuerzo, no memoria útil | — |
-| C8 | la ganancia de retrieval tiene coste de calibración (ECE/NLL corrupto empeoran) | `parcial` | `notebooks/11_retrieval_memory/out/e11_results.csv` (cols `ece_corrupt_avg`, `nll_corrupt_avg`) | ImageNet-C | 2026-06-05 | DEUDA central del epic: el criterio de éxito exige acotar ECE/NLL, no accuracy a secas. Candidatos: temperatura/escala separada de `logits_cache`, gate por margen/acuerdo | wtq |
+| C8 | la ganancia de retrieval tiene coste de calibración (ECE/NLL corrupto empeoran) | `parcial` | `notebooks/11_retrieval_memory/out/e11_results.csv` (cols `ece_corrupt_avg`, `nll_corrupt_avg`) | ImageNet-C | 2026-06-05 | DEUDA central del epic: el criterio de éxito exige acotar ECE/NLL, no accuracy a secas. Candidatos: temperatura/escala separada de `logits_cache`, gate por margen/acuerdo | wtq.8 |
 
 ## Cobertura OOD (qué shift, dónde, estado del experimento)
 
@@ -53,7 +53,7 @@ retrieval es Flowers + ImageNet (C y R) + CIFAR-C.
 
 | dataset / backbone | rol en la tesis | tipo de shift | granularidad | severidad | estado | issue |
 |--------------------|-----------------|---------------|--------------|-----------|--------|-------|
-| Flowers-102 / RN18 | control fino + baselines del trade-off + ablaciones de codebook | sintético (gaussian_noise, pixel_mask, cutout, blur) | fino | grid 3 niveles | baselines hechos; retrieval E11 NO portado aún | wtq.5 |
+| Flowers-102 / RN18 | control de dominio + baselines del trade-off + ablaciones de codebook + 2º dominio para C4 — **NO evidencia de robustez fuerte** (dominio benigno: shift sintético sobre clases que el backbone ya separa) | sintético (gaussian_noise, pixel_mask, cutout, blur) | fino | grid 3 niveles | baselines hechos; retrieval E11 NO portado aún | wtq.5 |
 | ImageNet-C / RN50 | escala | sintético (gaussian_noise, motion_blur, pixelate, jpeg) | medio | sev 3, 5 | E10 + E11 hechos | wtq.1 |
 | ImageNet-R o Sketch / RN50 | refutar "solo es denoising de ruido sintético" | **natural / semántico** (renditions/sketch) | medio | n/a | PENDIENTE | wtq.6 |
 | CIFAR-10-C / CIFAR-100-C | curva de severidad barata | sintético (15 corrupciones) | grueso / medio | **1–5** | PENDIENTE (se ordena después) | wtq.7 |
@@ -68,6 +68,15 @@ retrieval es Flowers + ImageNet (C y R) + CIFAR-C.
   decidir si se reporta como "mejora relativa al sustrato congelado" o se fortalece la base.
 - **Dominio del positivo (C3/C4):** sostenido solo en ImageNet-C. Portar E11 a Flowers y añadir
   shift natural (ImageNet-R) y curva (CIFAR-C) para sacar C4 de `parcial`.
+- **Riesgo de robustez solo en dominios benignos (C4):** si el trade-off roto vive solo en
+  ImageNet-C (sintético) + Flowers (simple + sintético), ambos son corrupción de píxel sobre
+  dominios donde el backbone ya separa bien — un revisor puede leer eso como "solo denoising",
+  no robustez general. Flowers NO carga este claim (es control de dominio, ver matriz); el peso
+  de robustez fuerte lo lleva **ImageNet-R** (wtq.6, único shift natural del slate). Por eso su
+  criticidad epistémica supera su prioridad-de-trabajo (P2): no es opcional, es el blindaje.
+- **Calibración transversal (C8):** no es un paso final sino una condición que se re-mide en
+  cada dominio del slate (wtq.8 atraviesa wtq.5/.6/.7). C4 no sube a `sostenido` sin ECE/NLL
+  acotado, no solo accuracy.
 - **Calibración (C8):** criterio de éxito del epic = ganancia robusta CON ECE/NLL acotado.
 - **Pivote narrativo consumado:** zq→z_pool (C5/C6); el codebook es ahora ablación, no mecanismo.
 
