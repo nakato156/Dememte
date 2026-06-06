@@ -215,6 +215,7 @@ def build_imagenet_loaders(
     max_train_samples: int | None = None,
     max_val_samples: int | None = None,
     seed: int = 42,
+    pin_memory: bool = True,
 ) -> tuple[DataLoader, DataLoader, dict]:
     train_ds = ImageNetFolderDataset(
         root,
@@ -241,10 +242,10 @@ def build_imagenet_loaders(
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=pin_memory,
         generator=generator,
     )
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
     meta = {
         "dataset": "imagenet",
         "root": str(Path(root).expanduser()),
@@ -267,6 +268,7 @@ def build_imagenet_c_loader(
     max_samples: int | None = None,
     seed: int = 42,
     shuffle: bool = False,
+    pin_memory: bool = True,
 ) -> tuple[DataLoader, dict]:
     dataset = ImageNetCDataset(
         root,
@@ -278,7 +280,7 @@ def build_imagenet_c_loader(
         max_samples=max_samples,
         seed=seed,
     )
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=True)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=pin_memory)
     meta = {
         "dataset": "imagenet_c",
         "root": str(Path(root).expanduser()),
@@ -301,6 +303,7 @@ def build_imagenet_c_loaders(
     max_samples_per_class: int | None = None,
     max_samples: int | None = None,
     seed: int = 42,
+    pin_memory: bool = True,
 ) -> tuple[dict[tuple[str, int], DataLoader], dict]:
     loaders: dict[tuple[str, int], DataLoader] = {}
     records = []
@@ -316,6 +319,7 @@ def build_imagenet_c_loaders(
                 max_samples_per_class=max_samples_per_class,
                 max_samples=max_samples,
                 seed=seed,
+                pin_memory=pin_memory,
             )
             loaders[(corruption, int(severity))] = loader
             records.append(meta)
