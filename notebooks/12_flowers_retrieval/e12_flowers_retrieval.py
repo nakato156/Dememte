@@ -5,7 +5,8 @@ Two independent outputs, two CSVs (they feed C1 and C4 separately in THESIS.md):
   Output 1 (C1): FT-clean baseline  -> out/ft_clean_baseline.csv
   Output 2 (C4): E11 retrieval      -> out/e11_retrieval_flowers.csv
 
-Reuses existing code only — no new algorithms. See plan composed-tickling-coral.md.
+Reuses existing code only — no new algorithms. Tracking: bead Demente-wtq.5;
+results write-up in notebooks/12_flowers_retrieval/insights.md.
 
 Run:  PYTHONPATH=src uv run python notebooks/12_flowers_retrieval/e12_flowers_retrieval.py [--section all|ftclean|retrieval] [--smoke]
 """
@@ -13,7 +14,6 @@ Run:  PYTHONPATH=src uv run python notebooks/12_flowers_retrieval/e12_flowers_re
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import torch
@@ -25,7 +25,7 @@ from dememte.evaluation import evaluate_baseline_suite, evaluate_dememte_suite, 
 from dememte.io import save_checkpoint, write_csv, write_json
 from dememte.models.baseline import ResNetBaseline
 from dememte.models.dememte import make_dememte_variant
-from dememte.retrieval import RetrievalCache, RetrievalConfig, RetrievalLogitAdapter, build_labeled_cache
+from dememte.retrieval import RetrievalConfig, RetrievalLogitAdapter, build_labeled_cache
 from dememte.training import train_baseline_phased
 
 HERE = Path(__file__).resolve().parent
@@ -33,6 +33,8 @@ OUT = HERE / "out"
 DATA_DIR = (HERE / "../../experiments/data").resolve().as_posix()
 E6_CKPT = (HERE / "../06_e6_zq_alignment/out/e6_ema_kmeans_restart/best.pt").resolve()
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+BATCH_SIZE = 64
+NUM_WORKERS = 4
 ALPHA_GRID = [0.25, 0.5, 1.0, 2.0, 4.0]
 SUMMARY_COLS = [
     "variant", "clean_acc", "corrupt_acc_avg",
@@ -41,7 +43,7 @@ SUMMARY_COLS = [
 ]
 
 
-def _loaders(batch_size=64, num_workers=4):
+def _loaders(batch_size=BATCH_SIZE, num_workers=NUM_WORKERS):
     return build_flowers_loaders(
         DATA_DIR, batch_size=batch_size, num_workers=num_workers,
         val_ratio=0.2, split_seed=42, protocol="historical_trainval_resplit", download=False,
@@ -63,6 +65,7 @@ def run_ft_clean(smoke=False):
         backbone_name="resnet18", backbone_out_channels=512, backbone_pretrained=True,
         freeze_backbone=False,          # full fine-tune
         train_corrupt_prob=0.0,         # CLEAN training — the whole point (vs nb04 FT-aug)
+        batch_size=BATCH_SIZE, num_workers=NUM_WORKERS,  # match _loaders so saved config reproduces
         device=DEVICE, out_dir=str(OUT), seed=42,
     )
     if smoke:
