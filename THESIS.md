@@ -39,12 +39,12 @@ el `inform`, releer su(s) CSV si la fecha es vieja.
 |----|-------|--------|------------------|----------|------------|-----------------|-------|
 | C1 | aug+FT compra corrupt a costa de clean (existe el trade-off) | `sostenido` | `notebooks/01_baseline/out/baseline_summary.csv`; `notebooks/12_flowers_retrieval/out/ft_clean_baseline.csv` | Flowers | 2026-06-06 | trade-off AISLADO con la pata FT-clean que faltaba: FT-clean (alto clean/bajo corrupt) vs FT-aug (menor clean/mayor corrupt) muestra que la augmentation compra corrupt a costa de clean. Reproducible desde los CSV citados (perfiles enfrentados) | wtq.5 |
 | C2 | memoria latente conservadora (λ≤0.1, LN affine, memreg que pina drift) es inerte en accuracy | `negativo-útil` | `notebooks/08_e7b_tta/out/e7b_results.csv`; `notebooks/09_e7c_codebook/out/e7c_results.csv`; `notebooks/10_memory_hippocampal/out/e10_results.csv`; `notebooks/10b_imagenet_c/out/e10_imagenet_c_results.csv` | Flowers, ImageNet-C | 2026-06-05 | causa diagnosticada: clasificador frozen + downstream; LN gradiente estructuralmente nulo (E7b); soft-mix se lava antes del logit (E10, ambos dominios) | wtq |
-| C3 | retrieval no-paramétrico que vota en el logit (`logits_base + α·logits_cache`) SÍ mueve la predicción | `sostenido` | `notebooks/11_retrieval_memory/out/e11_results.csv` | ImageNet-C | 2026-06-05 | — | wtq.1 |
-| C4 | ese retrieval rompe el trade-off (sube clean Y corrupt simultáneo) | `parcial` | `notebooks/11_retrieval_memory/out/e11_results.csv` (variante `source_cache_z_pool_fixed_alpha`); `notebooks/12_flowers_retrieval/out/e11_retrieval_flowers.csv` (barrido α) | ImageNet-C, Flowers | 2026-06-06 | (a) **CERRADA**: 2º dominio (Flowers) replica que el retrieval sube clean Y corrupt sobre el source; coste de calibración acotado a α≈1.0 (gate C8/wtq.8). (b) **abierta**: sigue siendo mejora relativa al sustrato congelado, no SOTA — en Flowers FT-aug domina en absoluto a DeMemte+retrieval; en ImageNet-C ResNet50 plano supera al sustrato. Reportar como mejora sobre el sustrato frozen | wtq.5 |
+| C3 | retrieval no-paramétrico que vota en el logit (`logits_base + α·logits_cache`) SÍ mueve la predicción | `sostenido` | `notebooks/11_retrieval_memory/out/e11_results.csv`; `notebooks/13_imagenet_r/out/e13_imagenet_r.csv` | ImageNet-C, ImageNet-R | 2026-06-07 | reforzado con shift **natural** (ImageNet-R): el voto episódico mueve la predicción aun sin ruido sintético que quitar | wtq.1, wtq.6 |
+| C4 | ese retrieval rompe el trade-off (sube clean Y corrupt simultáneo) | `parcial` | `notebooks/11_retrieval_memory/out/e11_results.csv` (variante `source_cache_z_pool_fixed_alpha`); `notebooks/12_flowers_retrieval/out/e11_retrieval_flowers.csv` (barrido α); `notebooks/13_imagenet_r/out/e13_imagenet_r.csv` (shift natural, barrido α) | ImageNet-C, Flowers, ImageNet-R | 2026-06-07 | (a) **CERRADA**: replicado en 3 dominios (ImageNet-C sintético, Flowers sintético-benigno, ImageNet-R **natural**); el retrieval sube clean Y shift sobre el source, coste calibración acotado a α≈1.0 (gate C8/wtq.8). El 3er dominio (R) es de naturaleza distinta → relaja la tensión "solo dominios benignos/sintéticos". (b) **abierta**: sigue siendo mejora relativa al sustrato congelado, no SOTA — FT-aug domina en Flowers; RN50 plano supera al sustrato en ImageNet-C y en R los absolutos son bajos (base VQSA débil). Reportar como mejora sobre el sustrato frozen | wtq.5, wtq.6 |
 | C5 | la representación útil para recuperar vecinos es `z_pool` (continuo, pre-cuantización), no `zq_pool` | `sostenido` | `notebooks/11_retrieval_memory/out/e11_results.csv`; `notebooks/11_retrieval_memory/insights.md` (Insight 2) | ImageNet-C | 2026-06-05 | — | — |
 | C6 | el codebook (`zq_pool`) como clave de memoria está aliasado: vota con fuerza pero sin precisión | `negativo-útil` | `notebooks/11_retrieval_memory/out/e11_results.csv` (variante `source_cache_zq_pool_fixed_alpha`) | ImageNet-C | 2026-06-05 | reframe del pivote: zq deja de ser "la memoria" y pasa a ablación negativa que justifica el uso de z_pool. Gate de unfamiliarity lo rescata parcialmente pero queda lejos de z_pool | — |
 | C7 | memoria episódica online con pseudo-labels se contamina (rompe más de lo que repara) | `negativo-útil` | `notebooks/11_retrieval_memory/out/e11_results.csv` (variantes `episodic_cache_zq_pool`, `dual_cache_zq_pool`) | ImageNet-C | 2026-06-05 | lección para el claim biológico: plasticidad episódica sin filtro de verdad = auto-refuerzo, no memoria útil | — |
-| C8 | la ganancia de retrieval tiene coste de calibración (ECE/NLL corrupto empeoran) | `parcial` | `notebooks/11_retrieval_memory/out/e11_results.csv` (cols `ece_corrupt_avg`, `nll_corrupt_avg`) | ImageNet-C | 2026-06-05 | DEUDA central del epic: el criterio de éxito exige acotar ECE/NLL, no accuracy a secas. Candidatos: temperatura/escala separada de `logits_cache`, gate por margen/acuerdo | wtq.8 |
+| C8 | la ganancia de retrieval tiene coste de calibración (ECE/NLL corrupto empeoran) | `parcial` | `notebooks/11_retrieval_memory/out/e11_results.csv` (cols `ece_corrupt_avg`, `nll_corrupt_avg`); `notebooks/12_flowers_retrieval/out/e11_retrieval_flowers.csv`; `notebooks/13_imagenet_r/out/e13_imagenet_r.csv` (cols `ece`, `nll`, `brier`) | ImageNet-C, Flowers, ImageNet-R | 2026-06-07 | DEUDA central del epic: el criterio de éxito exige acotar ECE/NLL, no accuracy a secas. Patrón confirmado en 3 dominios: ganancia con coste acotado a α≈1.0 (en R Brier incluso mejora, NLL ~plano hasta α=1.0). Candidatos: temperatura/escala separada de `logits_cache`, gate por margen/acuerdo | wtq.8 |
 
 ## Cobertura OOD (qué shift, dónde, estado del experimento)
 
@@ -55,7 +55,7 @@ retrieval es Flowers + ImageNet (C y R) + CIFAR-C.
 |--------------------|-----------------|---------------|--------------|-----------|--------|-------|
 | Flowers-102 / RN18 | control de dominio + baselines del trade-off + ablaciones de codebook + 2º dominio para C4 — **NO evidencia de robustez fuerte** (dominio benigno: shift sintético sobre clases que el backbone ya separa) | sintético (gaussian_noise, pixel_mask, cutout, blur) | fino | grid 3 niveles | retrieval E11 portado (z_pool, barrido α) + FT-clean baseline hechos | wtq.5 |
 | ImageNet-C / RN50 | escala | sintético (gaussian_noise, motion_blur, pixelate, jpeg) | medio | sev 3, 5 | E10 + E11 hechos | wtq.1 |
-| ImageNet-R o Sketch / RN50 | refutar "solo es denoising de ruido sintético" | **natural / semántico** (renditions/sketch) | medio | n/a | PENDIENTE | wtq.6 |
+| ImageNet-R / RN50 | refutar "solo es denoising de ruido sintético" | **natural / semántico** (renditions) | medio | n/a | retrieval E11 portado (z_pool, máscara-200 Hendrycks, barrido α); el efecto SOBREVIVE al shift natural — sube clean Y R, coste calibración acotado a α≈1.0 → `notebooks/13_imagenet_r/out/e13_imagenet_r.csv` | wtq.6 |
 | CIFAR-10-C / CIFAR-100-C | curva de severidad barata | sintético (15 corrupciones) | grueso / medio | **1–5** | PENDIENTE (se ordena después) | wtq.7 |
 
 ## Tensiones abiertas (resumen vivo)
@@ -66,15 +66,15 @@ retrieval es Flowers + ImageNet (C y R) + CIFAR-C.
 - **Base ImageNet débil (C4):** el checkpoint `dememte_imagenet_resnet50_vqsa` rinde muy por
   debajo de ResNet50 plano en ImageNet-C. El positivo E11 es sobre esa base, no sobre SOTA —
   decidir si se reporta como "mejora relativa al sustrato congelado" o se fortalece la base.
-- **Dominio del positivo (C3/C4):** ya en 2 dominios (ImageNet-C + Flowers, wtq.5). Falta el
-  shift natural (ImageNet-R, wtq.6) y la curva de severidad (CIFAR-C, wtq.7); la deuda que
-  mantiene C4 en `parcial` es ahora la (b) no-SOTA, no el dominio único.
-- **Riesgo de robustez solo en dominios benignos (C4):** si el trade-off roto vive solo en
-  ImageNet-C (sintético) + Flowers (simple + sintético), ambos son corrupción de píxel sobre
-  dominios donde el backbone ya separa bien — un revisor puede leer eso como "solo denoising",
-  no robustez general. Flowers NO carga este claim (es control de dominio, ver matriz); el peso
-  de robustez fuerte lo lleva **ImageNet-R** (wtq.6, único shift natural del slate). Por eso su
-  criticidad epistémica supera su prioridad-de-trabajo (P2): no es opcional, es el blindaje.
+- **Dominio del positivo (C3/C4):** ya en 3 dominios (ImageNet-C + Flowers + ImageNet-R, wtq.6).
+  Falta solo la curva de severidad (CIFAR-C, wtq.7); la deuda que mantiene C4 en `parcial` es la
+  (b) no-SOTA, no el dominio ni la naturaleza del shift.
+- **Riesgo de robustez solo en dominios benignos (C4): RELAJADO (wtq.6).** El blindaje que
+  cargaba ImageNet-R ya está: el efecto SOBREVIVE a un shift natural/semántico (renditions, sin
+  ruido sintético que quitar) — sube clean Y R con coste de calibración acotado a α≈1.0
+  (`notebooks/13_imagenet_r/out/e13_imagenet_r.csv`). La objeción "solo denoising de ruido
+  sintético" ya no queda en pie. Queda el matiz honesto: absolutos bajos en R por la base RN50
+  VQSA débil (deuda C4-b), el claim vive en el delta source→retrieval, no en el absoluto.
 - **Calibración transversal (C8):** no es un paso final sino una condición que se re-mide en
   cada dominio del slate (wtq.8 atraviesa wtq.5/.6/.7). C4 no sube a `sostenido` sin ECE/NLL
   acotado, no solo accuracy.
