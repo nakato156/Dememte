@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -35,7 +36,7 @@ REPO = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
 OUT = HERE / "out"
 CLEAN_DIR = (REPO / "experiments/data/imagenet-clean-5k").as_posix()   # source cache + clean ref
-R_ROOT = "/home/r0sewt/data"                                           # ImageNet-R lives off /shared (disk full)
+R_ROOT = os.environ.get("IMAGENET_R_ROOT", "/home/r0sewt/data")        # ImageNet-R lives off /shared (disk full); override per-host
 R_SPLIT = "imagenet-r"
 CKPT = REPO / "experiments/imagenet_dememte/out/dememte_imagenet_resnet50_vqsa_best.pt"
 TRAIN_CONFIG = REPO / "experiments/imagenet_dememte/out/train_config.json"
@@ -51,7 +52,8 @@ SUMMARY_COLS = ["variant", "domain", "acc", "ece", "nll", "brier"]
 # Model (frozen RN50 VQSA, rebuilt from the saved train config)
 # --------------------------------------------------------------------------- #
 def load_model():
-    cfg_json = json.load(open(TRAIN_CONFIG))["config"]
+    with open(TRAIN_CONFIG) as f:
+        cfg_json = json.load(f)["config"]
     valid = {f.name for f in dataclasses.fields(E6Config)}
     cfg = E6Config(**{k: v for k, v in cfg_json.items() if k in valid})
     model = make_dememte_variant(cfg, device=DEVICE)
@@ -67,8 +69,14 @@ def load_model():
 def imagenet_r_mask():
     wnid_to_idx = load_imagenet_class_index(download=True)
     r_dir = Path(R_ROOT) / R_SPLIT
+    if not r_dir.is_dir():
+        raise FileNotFoundError(
+            f"ImageNet-R not found at {r_dir}. Set IMAGENET_R_ROOT or place wnid folders under <root>/{R_SPLIT}/."
+        )
     wnids = sorted(p.name for p in r_dir.iterdir() if p.is_dir() and p.name in wnid_to_idx)
     allowed = sorted(wnid_to_idx[w] for w in wnids)
+    if len(allowed) != 200:
+        raise ValueError(f"expected 200 ImageNet-R classes, found {len(allowed)} in {r_dir} (check dataset/class-index)")
     mask = torch.full((NUM_CLASSES,), float("-inf"), device=DEVICE)
     mask[allowed] = 0.0
     return allowed, mask
