@@ -7,7 +7,24 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from dememte.data import CIFAR_C_CORRUPTIONS, CIFARCDataset
+import dememte.data as data_mod
+from dememte.data import CIFAR_C_CORRUPTIONS, CIFARCDataset, build_cifar_loaders
+
+
+class _FakeCIFAR:
+    """Stand-in for torchvision.datasets.CIFAR10/100: exposes .targets, no download/IO."""
+
+    def __init__(self, root, train, download, transform):
+        self.train, self.transform = train, transform
+        n = 200 if train else 50
+        self.targets = [i % 10 for i in range(n)]  # 10 balanced classes
+        self._n = n
+
+    def __len__(self):
+        return self._n
+
+    def __getitem__(self, i):  # never iterated in these tests
+        return self.targets[i], self.targets[i]
 
 
 def _write_cifar_c(root: Path, dirname: str = "CIFAR-10-C", corruption: str = "gaussian_noise"):
@@ -67,3 +84,28 @@ def test_invalid_inputs_raise(tmp_path):
 def test_canonical_corruptions_count():
     assert len(CIFAR_C_CORRUPTIONS) == 15
     assert len(set(CIFAR_C_CORRUPTIONS)) == 15
+
+
+def test_build_cifar_loaders_split_and_meta(monkeypatch):
+    monkeypatch.setitem(data_mod._CIFAR_CLEAN_CTOR, "cifar10", _FakeCIFAR)
+    tr, va, te, meta = build_cifar_loaders("/tmp/none", "cifar10", batch_size=16,
+                                           num_workers=0, val_ratio=0.2, split_seed=42, download=False)
+    # 200 train -> 160/40 stratified; 50 test
+    assert meta["dataset"] == "cifar10"
+    assert (meta["train_size"], meta["val_size"], meta["test_size"]) == (160, 40, 50)
+    assert meta["split_seed"] == 42
+    assert len(tr.dataset) == 160 and len(va.dataset) == 40 and len(te.dataset) == 50
+    # train/val drawn from distinct underlying dataset instances (train_tf vs eval_tf)
+    assert tr.dataset.dataset is not va.dataset.dataset
+
+
+def test_build_cifar_loaders_is_deterministic(monkeypatch):
+    monkeypatch.setitem(data_mod._CIFAR_CLEAN_CTOR, "cifar10", _FakeCIFAR)
+    a = build_cifar_loaders("/tmp/none", "cifar10", num_workers=0, split_seed=42, download=False)[0]
+    b = build_cifar_loaders("/tmp/none", "cifar10", num_workers=0, split_seed=42, download=False)[0]
+    assert list(a.dataset.indices) == list(b.dataset.indices)
+
+
+def test_build_cifar_loaders_rejects_unknown_dataset():
+    with pytest.raises(ValueError):
+        build_cifar_loaders("/tmp/none", "mnist", download=False)
