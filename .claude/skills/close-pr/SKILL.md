@@ -22,7 +22,7 @@ Never merge before the Copilot review is read, answered, and its threads resolve
 
 1. **CI must be green.**
    ```bash
-   gh pr checks <PR>            # every check must be pass (not pending/fail)
+   gh pr checks <PR>            # every check must pass (not pending/fail)
    gh pr view <PR> --json mergeable,mergeStateStatus
    ```
    If pending, wait and re-check. If failing, stop and fix — do not merge.
@@ -73,8 +73,12 @@ Branch protection is what actually prevents the "merged without resolving Copilo
 regardless of who merges. Admin runs:
 ```bash
 gh api -X PUT repos/nakato156/Dememte/branches/main/protection --input - <<'JSON'
-{"required_status_checks":{"strict":true,"contexts":["test"]},
+{"required_status_checks":null,
  "enforce_admins":false,"required_pull_request_reviews":null,
  "restrictions":null,"required_conversation_resolution":true}
 JSON
 ```
+The key field is `required_conversation_resolution` (blocks merge with unresolved Copilot
+threads). To *also* require CI, confirm the check's exact context name first (`gh pr checks`
+shows it — here `test`) and set `"required_status_checks":{"strict":true,"contexts":["test"]}`;
+using a wrong context silently fails to require the check.
