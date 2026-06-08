@@ -130,6 +130,30 @@ class FlowersLegacyConfig(E5Config):
     backbone_out_channels: int = 512
 
 
+@dataclass
+class CIFAR10Config(E5Config):
+    """CIFAR-10 VQSA substrate (frozen RN18, ImageNet-pretrained; inputs resized 32->224)."""
+
+    dataset: str = "cifar10"
+    data_dir: str = "../../experiments/data"
+    num_classes: int = 10
+    backbone_name: str = "resnet18"
+    backbone_out_channels: int = 512
+    batch_size: int = 64
+
+
+@dataclass
+class CIFAR100Config(E5Config):
+    """CIFAR-100 VQSA substrate (frozen RN18, ImageNet-pretrained; inputs resized 32->224)."""
+
+    dataset: str = "cifar100"
+    data_dir: str = "../../experiments/data"
+    num_classes: int = 100
+    backbone_name: str = "resnet18"
+    backbone_out_channels: int = 512
+    batch_size: int = 64
+
+
 # -- Ablation registry --------------------------------------------------------
 
 ABLATION_SPECS = {

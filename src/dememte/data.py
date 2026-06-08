@@ -383,6 +383,102 @@ def build_flowers_loaders(
     return tr_loader, va_loader, te_loader, meta
 
 
+# -- CIFAR-10/100 + CIFAR-C (Hendrycks) --------------------------------------
+
+CIFAR_C_CORRUPTIONS = (
+    "gaussian_noise", "shot_noise", "impulse_noise", "defocus_blur", "glass_blur",
+    "motion_blur", "zoom_blur", "snow", "frost", "fog", "brightness", "contrast",
+    "elastic_transform", "pixelate", "jpeg_compression",
+)
+_CIFAR_C_DIRNAME = {"cifar10": "CIFAR-10-C", "cifar100": "CIFAR-100-C"}
+_CIFAR_CLEAN_CTOR = {"cifar10": torchvision.datasets.CIFAR10, "cifar100": torchvision.datasets.CIFAR100}
+
+
+class CIFARCDataset(Dataset):
+    """CIFAR-10-C / CIFAR-100-C from Hendrycks ``.npy`` arrays.
+
+    Layout: ``<root>/CIFAR-10-C/<corruption>.npy`` shape ``(50000,32,32,3)`` uint8 plus
+    ``labels.npy`` shape ``(50000,)``. Severity ``s in 1..5`` selects the contiguous block
+    ``[(s-1)*10000 : s*10000]`` (10k test images, same order across blocks).
+    """
+
+    def __init__(self, root, dataset, corruption, severity, transform=None,
+                 *, max_samples=None, seed=42):
+        self.dataset = str(dataset)
+        if self.dataset not in _CIFAR_C_DIRNAME:
+            raise ValueError(f"dataset must be one of {list(_CIFAR_C_DIRNAME)}, got {dataset!r}")
+        if str(corruption) not in CIFAR_C_CORRUPTIONS:
+            raise ValueError(f"unknown CIFAR-C corruption {corruption!r}")
+        sev = int(severity)
+        if not 1 <= sev <= 5:
+            raise ValueError(f"severity must be in 1..5, got {severity}")
+        c_dir = Path(root).expanduser() / _CIFAR_C_DIRNAME[self.dataset]
+        arr_path, lbl_path = c_dir / f"{corruption}.npy", c_dir / "labels.npy"
+        if not arr_path.exists() or not lbl_path.exists():
+            raise FileNotFoundError(f"CIFAR-C not found: expected {arr_path} and {lbl_path}")
+        lo, hi = (sev - 1) * 10000, sev * 10000
+        self.images = np.load(arr_path, mmap_mode="r")[lo:hi]
+        self.labels = np.asarray(np.load(lbl_path)[lo:hi], dtype=np.int64)
+        self.transform = transform or _make_transforms()[1]
+        self.corruption, self.severity = str(corruption), sev
+        if max_samples is not None and len(self.labels) > max_samples:
+            rng = np.random.default_rng(seed)
+            idx = np.sort(rng.choice(len(self.labels), int(max_samples), replace=False))
+            self.images, self.labels = self.images[idx], self.labels[idx]
+
+    def __len__(self) -> int:
+        return len(self.labels)
+
+    def __getitem__(self, index):
+        image = Image.fromarray(np.asarray(self.images[index]))  # uint8 HWC -> PIL RGB
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, int(self.labels[index])
+
+
+def build_cifar_loaders(
+    data_dir: str,
+    dataset: str,
+    batch_size: int = 64,
+    num_workers: int = 4,
+    val_ratio: float = 0.2,
+    split_seed: int = 42,
+    download: bool = True,
+    pin_memory: bool = False,
+) -> Tuple[DataLoader, DataLoader, DataLoader, dict]:
+    """Clean CIFAR-10/100 loaders (train/val/test) with the standard 224 resize transforms.
+
+    Stratified train/val split (seed=42), same shape as ``build_flowers_loaders``. The train
+    loader (augmented) is what feeds ``build_labeled_cache`` for the retrieval source cache.
+    """
+    if dataset not in _CIFAR_CLEAN_CTOR:
+        raise ValueError(f"dataset must be one of {list(_CIFAR_CLEAN_CTOR)}, got {dataset!r}")
+    train_tf, eval_tf = _make_transforms()
+    ctor = _CIFAR_CLEAN_CTOR[dataset]
+    tr_train_tf = ctor(root=data_dir, train=True, download=download, transform=train_tf)
+    tr_eval_tf = ctor(root=data_dir, train=True, download=download, transform=eval_tf)
+    te = ctor(root=data_dir, train=False, download=download, transform=eval_tf)
+
+    y = np.asarray(tr_train_tf.targets)
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=val_ratio, random_state=split_seed)
+    train_idx, val_idx = next(splitter.split(np.zeros(len(y)), y))
+    tr_ds = Subset(tr_train_tf, train_idx.tolist())
+    va_ds = Subset(tr_eval_tf, val_idx.tolist())  # val uses eval transform (no augmentation)
+    meta = {
+        "dataset": dataset,
+        "split_seed": split_seed,
+        "train_size": len(tr_ds),
+        "val_size": len(va_ds),
+        "test_size": len(te),
+    }
+    generator = torch.Generator()
+    generator.manual_seed(split_seed)
+    tr_loader = DataLoader(tr_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_memory, generator=generator)
+    va_loader = DataLoader(va_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+    te_loader = DataLoader(te, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_memory)
+    return tr_loader, va_loader, te_loader, meta
+
+
 def build_loaders(*args, **kwargs) -> Tuple[DataLoader, DataLoader, DataLoader, dict]:
     """Legacy alias for Flowers102 loaders.
 
