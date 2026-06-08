@@ -37,3 +37,7 @@ VALIDATIONS.md
 .dolt/
 *.db
 .beads-credential-key
+
+# Living report build artifacts (regenerated from CSVs via 'typst compile inform.typ')
+/inform.pdf
+/check_*.png
