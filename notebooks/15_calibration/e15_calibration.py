@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -54,6 +55,9 @@ GATE_MODE = "unfamiliarity"
 KEY_SPACE = "z_pool"
 BATCH = 128
 NW = 4
+# Datasets live off /shared (disk full); override per-host (same convention as E13/E14).
+CIFAR_DATA_ROOT = os.environ.get("CIFAR_DATA_ROOT", "/home/r0sewt/data")
+IMAGENET_R_ROOT = os.environ.get("IMAGENET_R_ROOT", "/home/r0sewt/data")
 ALL_DOMAINS = ["flowers", "cifar10", "cifar100", "imagenet_r", "imagenet_c"]
 
 
@@ -167,7 +171,7 @@ def provider_flowers(smoke):
 
 
 def provider_cifar(ds, smoke):
-    data_root = "/home/r0sewt/data"
+    data_root = CIFAR_DATA_ROOT
     base_cls = CIFAR10Config if ds == "cifar10" else CIFAR100Config
     ncls = 10 if ds == "cifar10" else 100
     tr, va, te, _ = build_cifar_loaders(data_root, ds, batch_size=BATCH, num_workers=NW,
@@ -207,7 +211,7 @@ def _folder(root, split, cap=None):
 
 def provider_imagenet_r(smoke):
     clean_dir = (REPO / "experiments/data/imagenet-clean-5k").as_posix()
-    r_root, r_split = "/home/r0sewt/data", "imagenet-r"
+    r_root, r_split = IMAGENET_R_ROOT, "imagenet-r"
     model = _imagenet_rn50()
     wnid_to_idx = load_imagenet_class_index(download=True)
     r_dir = Path(r_root) / r_split

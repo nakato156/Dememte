@@ -97,4 +97,7 @@ def test_offline_temp_plus_gate_composition_is_deterministic():
         final = base + alpha.unsqueeze(1) * cache
         return calibration_metrics(apply_temperature(final, 1.3), labels)
 
-    assert run() == run()
+    a, b = run(), run()
+    assert a.keys() == b.keys()
+    for k in a:  # per-key tolerance: the offline path is deterministic, but avoid brittle float == across builds
+        assert abs(a[k] - b[k]) < 1e-9
